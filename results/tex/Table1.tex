@@ -1,0 +1,24 @@
+
+\begin{table}[t]
+\centering
+\scriptsize
+\caption{ROC-AUC and PR-AUC performance on CUB-200-2011 and Oxford Flowers-102.}
+\label{tab:table1}
+\begin{tabular}{llcccccccccccc}
+\toprule
+Dataset & Model & \multicolumn{6}{c}{ROC-AUC} & \multicolumn{6}{c}{PR-AUC} \\
+\cmidrule(lr){3-8} \cmidrule(lr){9-14}
+ & & \multicolumn{2}{c}{unseen} & \multicolumn{2}{c}{seen} & \multicolumn{2}{c}{mean} & \multicolumn{2}{c}{unseen} & \multicolumn{2}{c}{seen} & \multicolumn{2}{c}{mean} \\
+\cmidrule(lr){3-4} \cmidrule(lr){5-6} \cmidrule(lr){7-8} \cmidrule(lr){9-10} \cmidrule(lr){11-12} \cmidrule(lr){13-14}
+ & & Paper & Ours & Paper & Ours & Paper & Ours & Paper & Ours & Paper & Ours & Paper & Ours \\
+\midrule
+CU-Bird200-2011 & fc & 0.82 & 0.797 & 0.974 & 0.978 & 0.943 & 0.942 & 0.11 & 0.240 & 0.33 & 0.467 & 0.286 & 0.422 \\
+CU-Bird200-2011 & conv & 0.80 & 0.710 & 0.96 & 0.928 & 0.925 & 0.885 & 0.085 & 0.085 & 0.15 & 0.153 & 0.14 & 0.139 \\
+CU-Bird200-2011 & fc+conv & 0.85 & 0.819 & 0.98 & 0.964 & 0.953 & 0.935 & 0.13 & 0.228 & 0.37 & 0.335 & 0.31 & 0.314 \\
+Oxford Flower & fc & 0.70 & 0.540 & 0.987 & 0.928 & 0.90 & 0.852 & 0.07 & 0.082 & 0.65 & 0.433 & 0.52 & 0.364 \\
+Oxford Flower & conv & 0.65 & 0.550 & 0.97 & 0.852 & 0.85 & 0.792 & 0.054 & 0.085 & 0.61 & 0.173 & 0.46 & 0.156 \\
+Oxford Flower & fc+conv & 0.71 & 0.535 & 0.989 & 0.869 & 0.93 & 0.803 & 0.067 & 0.085 & 0.69 & 0.419 & 0.56 & 0.353 \\
+\bottomrule
+\end{tabular}
+\end{table}
+

@@ -1,0 +1,25 @@
+
+\begin{table}[t]
+\centering
+\scriptsize
+\caption{Model performance using various objective functions. Paper values are from CUB-200-2010; Ours from CUB-200-2011.}
+\label{tab:table2}
+\begin{tabular}{lrrrrrr}
+\toprule
+Metrics & BCE (Paper) & BCE (Ours) & Hinge (Paper) & Hinge (Ours) & Euclidean (Paper) & Euclidean (Ours) \\ \midrule
+unseen ROC-AUC & 0.82 & 0.697 & 0.795 & 0.641 & 0.70 & 0.797 \\
+seen ROC-AUC & 0.973 & 0.972 & 0.97 & 0.899 & 0.95 & 0.978 \\
+mean ROC-AUC & 0.937 & 0.917 & 0.934 & 0.847 & 0.90 & 0.942 \\
+unseen PR-AUC & 0.103 & 0.074 & 0.10 & 0.061 & 0.076 & 0.240 \\
+seen PR-AUC & 0.33 & 0.411 & 0.41 & 0.269 & 0.37 & 0.467 \\
+mean PR-AUC & 0.287 & 0.344 & 0.35 & 0.228 & 0.31 & 0.422 \\
+unseen class acc. & 0.01 & 0.141 & 0.006 & 0.082 & 0.12 & 0.271 \\
+seen class acc. & 0.35 & 0.437 & 0.43 & 0.484 & 0.263 & 0.446 \\
+mean class acc. & 0.17 & 0.378 & 0.205 & 0.403 & 0.19 & 0.411 \\
+unseen top-5 acc. & 0.176 & 0.399 & 0.182 & 0.294 & 0.428 & 0.556 \\
+seen top-5 acc. & 0.58 & 0.767 & 0.668 & 0.827 & 0.45 & 0.802 \\
+mean top-5 acc. & 0.38 & 0.693 & 0.41 & 0.721 & 0.44 & 0.753 \\
+ \bottomrule
+\end{tabular}
+\end{table}
+

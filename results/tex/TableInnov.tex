@@ -1,0 +1,85 @@
+\documentclass{article}
+
+\usepackage{booktabs}
+\usepackage[margin=1in]{geometry}
+\usepackage{siunitx}
+\usepackage{threeparttable}
+
+\sisetup{
+  detect-weight=true,
+  detect-inline-weight=math,
+  group-digits=false,
+  input-symbols = {—},
+  table-format=1.3,
+}
+
+\begin{document}
+
+% ===================== Table 1: Loss =====================
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{threeparttable}
+\caption{Ablation of loss functions on CUB-200-2011}
+\label{tab:innov_loss}
+\begin{tabular}{l S S S S}
+\toprule
+ & \multicolumn{2}{c}{Seen} & \multicolumn{2}{c}{Unseen} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+Setting & {PR-AUC} & {ROC-AUC} & {PR-AUC} & {ROC-AUC} \\
+\midrule
+BCE & 0.561 & 0.983 & 0.070 & 0.689 \\
+CLIP-loss & \bfseries 0.578 & \bfseries 0.985 & \bfseries 0.077 & \bfseries 0.702 \\
+CenterAln & 0.554 & 0.980 & 0.066 & 0.692 \\
+EmbMSE & 0.168 & 0.931 & 0.074 & 0.695 \\
+\bottomrule
+\end{tabular}
+\end{threeparttable}
+\end{table}
+
+% ===================== Table 2: Text Encoder =====================
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{6pt}
+\renewcommand{\arraystretch}{1.15}
+\caption{Ablation of text encoders (CUB-200-2011)}
+\label{tab:innov_text}
+\begin{tabular}{l S S S S}
+\toprule
+ & \multicolumn{2}{c}{Seen} & \multicolumn{2}{c}{Unseen} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+Text encoder & {PR-AUC} & {ROC-AUC} & {PR-AUC} & {ROC-AUC} \\
+\midrule
+TF-IDF(Baseline) & 0.335 & 0.964 & 0.228 & 0.819 \\
+SBERT & \bfseries 0.510 & 0.980 & 0.144 & 0.841 \\
+SBERT-multi & 0.487 & 0.979 & 0.143 & 0.804 \\
+CLIP-text & 0.500 & \bfseries 0.982 & \bfseries 0.284 & \bfseries 0.864 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ===================== Table 3: Backbone =====================
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{6pt}
+\renewcommand{\arraystretch}{1.15}
+\caption{Ablation of image backbones (CUB-200-2011)}
+\label{tab:innov_backbone}
+\begin{tabular}{l S S S S}
+\toprule
+ & \multicolumn{2}{c}{Seen} & \multicolumn{2}{c}{Unseen} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+Backbone & {PR-AUC} & {ROC-AUC} & {PR-AUC} & {ROC-AUC} \\
+\midrule
+VGG-19(Baseline) & 0.335 & 0.964 & \bfseries 0.228 & \bfseries 0.819 \\
+DNet121 & \bfseries 0.535 & \bfseries 0.983 & 0.090 & 0.740 \\
+ResNet50 & 0.416 & 0.970 & 0.066 & 0.682 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}

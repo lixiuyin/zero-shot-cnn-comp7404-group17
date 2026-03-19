@@ -1,0 +1,39 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+.env/
+venv/
+
+# macOS
+*.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# Logs / temporary
+*.log
+tmp/
+.pytest_cache/
+
+# Images dataset
+data/images/
+
+# Checkpoints
+checkpoints/
+
+# LaTeX results
+results/tex/*.log
+results/tex/*.aux
+results/*.log
+results/*.aux
+
+# Paper
+Paper/
