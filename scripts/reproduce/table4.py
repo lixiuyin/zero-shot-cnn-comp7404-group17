@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from data import ImageClassDataset, prepare_birds_50_50, prepare_flowers_50_50
-from scripts.reproduce.common import get_tables_dir, get_tex_dir, read_table_csv, resolve_checkpoint, write_table_csv
+from scripts.reproduce.common import get_tables_dir, get_tex_dir, read_table_csv, resolve_checkpoint as _resolve_checkpoint, write_table_csv
 from scripts.reproduce.eval_utils import compute_mean_metrics, load_model, run_inference
 from utils.config import (
     CONV_CHANNELS,
@@ -43,6 +43,9 @@ def main():
     parser.add_argument("--conv_feature_layer", type=str, default=CONV_FEATURE_LAYER,
                         choices=("conv5_3", "conv4_3", "pool5"),
                         help="Conv feature layer used during training (must match checkpoint)")
+    parser.add_argument("--image_backbone", type=str, default="vgg19",
+                        choices=("vgg19", "densenet121", "resnet50"),
+                        help="Image backbone used during training (default: vgg19)")
     parser.add_argument("--out_dir", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch_size", type=int, default=64)
@@ -65,7 +68,7 @@ def main():
         gv_hidden=GV_HIDDEN,
         conv_channels=CONV_CHANNELS,
         conv_feature_layer=args.conv_feature_layer,
-        image_backbone="vgg19",
+        image_backbone=args.image_backbone,
     )
 
     headers = ["Model", "CUB-2011 (Paper)", "CUB-2011 (Ours)", "Oxford Flowers (Paper)", "Oxford Flowers (Ours)"]
@@ -120,8 +123,8 @@ def main():
                 from tqdm import tqdm
 
                 models_to_eval = [
-                    (resolve_checkpoint(args.checkpoint_fc, args.checkpoint_dir, "fc"), "fc", 2),  # column index for Ours (CUB-2011)
-                    (resolve_checkpoint(args.checkpoint_fc_conv, args.checkpoint_dir, "fc_conv"), "fc+conv", 2),
+                    (_resolve_checkpoint("fc_bce_cub_5050", args.checkpoint_dir, args.checkpoint_fc), "fc", 2),
+                    (_resolve_checkpoint("fc_conv_bce_cub_5050", args.checkpoint_dir, args.checkpoint_fc_conv), "fc+conv", 2),
                 ]
                 for ckpt_arg, model_type, col_idx in tqdm(models_to_eval, desc="CUB 50/50 models", unit="model"):
                     if not ckpt_arg:
@@ -155,8 +158,8 @@ def main():
             from tqdm import tqdm
 
             models_to_eval = [
-                (resolve_checkpoint(args.checkpoint_fc, args.checkpoint_dir, "fc"), "fc", 4),  # column index for Ours (Oxford Flowers)
-                (resolve_checkpoint(args.checkpoint_fc_conv, args.checkpoint_dir, "fc_conv"), "fc+conv", 4),
+                (_resolve_checkpoint("fc_bce_flowers_5050", args.checkpoint_dir, args.checkpoint_fc), "fc", 4),
+                (_resolve_checkpoint("fc_conv_bce_flowers_5050", args.checkpoint_dir, args.checkpoint_fc_conv), "fc+conv", 4),
             ]
             for ckpt_arg, model_type, col_idx in tqdm(models_to_eval, desc="Flowers 50/50 models", unit="model"):
                 if not ckpt_arg:

@@ -30,8 +30,43 @@ def load_model(
     conv_channels: int = 5,
     conv_feature_layer: str = "conv5_3",
     image_backbone: str = "vgg19",
+    fc_mode: str = "default",
 ):
     from models.zero_shot_model import ZeroShotModel
+
+    # Load checkpoint and extract config metadata if available
+    state_dict = None
+    if checkpoint_path and Path(checkpoint_path).exists():
+        ckpt = torch.load(checkpoint_path, map_location=device)
+        if isinstance(ckpt, dict) and "state_dict" in ckpt:
+            state_dict = ckpt["state_dict"]
+            # Use saved config, warn if caller-provided values differ
+            cfg = ckpt.get("config", {})
+            _cfg_map = {
+                "text_dim": text_dim, "k": k, "ft_hidden": ft_hidden,
+                "gv_hidden": gv_hidden, "conv_channels": conv_channels,
+                "conv_feature_layer": conv_feature_layer,
+                "image_backbone": image_backbone,
+                "fc_mode": fc_mode,
+            }
+            for key, caller_val in _cfg_map.items():
+                saved_val = cfg.get(key)
+                if saved_val is not None and saved_val != caller_val:
+                    logger.warning(
+                        f"[CONFIG OVERRIDE] checkpoint has {key}={saved_val!r}, "
+                        f"caller passed {caller_val!r}; using checkpoint value"
+                    )
+            text_dim = cfg.get("text_dim", text_dim)
+            k = cfg.get("k", k)
+            ft_hidden = cfg.get("ft_hidden", ft_hidden)
+            gv_hidden = cfg.get("gv_hidden", gv_hidden)
+            conv_channels = cfg.get("conv_channels", conv_channels)
+            conv_feature_layer = cfg.get("conv_feature_layer", conv_feature_layer)
+            image_backbone = cfg.get("image_backbone", image_backbone)
+            fc_mode = cfg.get("fc_mode", fc_mode)
+        else:
+            # Legacy checkpoint: bare state_dict (no metadata)
+            state_dict = ckpt
 
     model = ZeroShotModel(
         text_input_dim=text_dim,
@@ -42,9 +77,10 @@ def load_model(
         conv_feature_layer=conv_feature_layer,
         image_backbone=image_backbone,
         model_type=model_type,
+        fc_mode=fc_mode,
     ).to(device)
-    if checkpoint_path and Path(checkpoint_path).exists():
-        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    if state_dict is not None:
+        model.load_state_dict(state_dict)
     model.eval()
     return model
 
@@ -107,7 +143,8 @@ def _metrics_over_classes(
     roc_mean = float(np.mean(roc_aucs)) if roc_aucs else 0.0
     pr_mean = float(np.mean(pr_aucs)) if pr_aucs else 0.0
     pred_top1 = np.argmax(sco_sub, axis=1)
-    pred_top5 = np.argsort(-sco_sub, axis=1)[:, :5]
+    top5_k = min(5, sco_sub.shape[1])
+    pred_top5 = np.argsort(-sco_sub, axis=1)[:, :top5_k]
     top1 = (pred_top1 == lab_local).mean()
     top5 = (pred_top5 == lab_local.reshape(-1, 1)).any(axis=1).mean()
     return roc_mean, pr_mean, float(top1), float(top5)
@@ -291,7 +328,8 @@ def compute_mean_metrics(
     pr_mean = float(np.mean(pr_aucs)) if pr_aucs else 0.0
     pred = np.argmax(scores, axis=1)
     top1 = (pred == labels).mean()
-    top5 = (np.argsort(-scores, axis=1)[:, :5] == labels.reshape(-1, 1)).any(axis=1).mean()
+    top5_k = min(5, scores.shape[1])
+    top5 = (np.argsort(-scores, axis=1)[:, :top5_k] == labels.reshape(-1, 1)).any(axis=1).mean()
     return {
         "roc_auc_mean": roc_mean,
         "pr_auc_mean": pr_mean,

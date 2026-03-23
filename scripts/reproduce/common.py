@@ -1,4 +1,15 @@
-"""Shared paths and helpers for reproduction scripts (Ba et al. ICCV 2015)."""
+"""Shared paths and helpers for reproduction scripts (Ba et al. ICCV 2015).
+
+Checkpoint resolution strategy
+------------------------------
+Each checkpoint key maps to an **exact** glob pattern (one file per key).
+No fallback heuristics — if the pattern doesn't match, the key is unresolved.
+
+For cross-validation, ``resolve_cv_checkpoints`` looks inside ``fold{i}/``
+subdirectories using the same patterns.  ``resolve_with_cv`` is the main
+entry point: it returns *both* the root checkpoint and any per-fold
+checkpoints so that callers can average across folds when available.
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -11,211 +22,179 @@ RESULTS_ROOT = CODE_ROOT / "results"
 DEFAULT_WIKIPEDIA_BIRDS = "data/wikipedia/birds.jsonl"
 DEFAULT_WIKIPEDIA_FLOWERS = "data/wikipedia/flowers.jsonl"
 
-# Default checkpoint directory (relative to CODE_ROOT). Scripts use --checkpoint_dir
-# and fallback to these filenames when --checkpoint_* is not set.
+# Default checkpoint directory (relative to CODE_ROOT).
 DEFAULT_CHECKPOINT_DIR = "checkpoints"
-CHECKPOINT_NAMES = {
-    "fc": "fc.pt",
-    "conv": "conv.pt",
-    "fc_conv": "fc_conv.pt",
-    "fc_bce": "fc_bce.pt",
-    "fc_hinge": "fc_hinge.pt",
-    "fc_euclidean": "fc_euclidean.pt",
-    "bce": "bce.pt",
-    "hinge": "hinge.pt",
-    "euclidean": "euclidean.pt",
-    "conv4_3": "conv4_3.pt",
-    "conv5_3": "conv5_3.pt",
-    "pool5": "pool5.pt",
-    # Per-model-type per-loss keys (used by table1 best-across-losses)
-    "conv_bce": "conv_bce.pt",
-    "conv_hinge": "conv_hinge.pt",
-    "conv_euclidean": "conv_euclidean.pt",
-    "fc_conv_bce": "fc_conv_bce.pt",
-    "fc_conv_hinge": "fc_conv_hinge.pt",
-    "fc_conv_euclidean": "fc_conv_euclidean.pt",
+
+# ---------------------------------------------------------------------------
+# Exact-match pattern table
+# ---------------------------------------------------------------------------
+# Every key maps to ONE glob pattern that should match at most one file.
+# Naming convention: {model}_{loss}_{dataset}_{layer}_{n_unseen}[_tr{ratio}].pt
+#
+# Default conv layer is conv5_3.  conv4_3 / pool5 have their own explicit keys.
+# ---------------------------------------------------------------------------
+CHECKPOINT_PATTERNS: dict[str, str] = {
+    # ── Table 1: model-type comparison (BCE, default layer) ───────────────
+    # CUB
+    "fc_bce_cub":              "fc_bce_cub_fc_*.pt",
+    "conv_bce_cub":            "conv_bce_cub_conv5_3_*.pt",
+    "fc_conv_bce_cub":         "fc_conv_bce_cub_conv5_3_*.pt",
+    # Flowers
+    "fc_bce_flowers":          "fc_bce_flowers_fc_*.pt",
+    "conv_bce_flowers":        "conv_bce_flowers_conv5_3_*.pt",
+    "fc_conv_bce_flowers":     "fc_conv_bce_flowers_conv5_3_*.pt",
+
+    # ── Table 1 extended: hinge / euclidean across model types ────────────
+    # CUB – fc
+    "fc_hinge_cub":            "fc_hinge_cub_fc_*.pt",
+    "fc_euclidean_cub":        "fc_euclidean_cub_fc_*.pt",
+    # CUB – conv (euclidean not supported for conv-only)
+    "conv_hinge_cub":          "conv_hinge_cub_conv5_3_*.pt",
+    # CUB – fc+conv
+    "fc_conv_hinge_cub":       "fc_conv_hinge_cub_conv5_3_*.pt",
+    "fc_conv_euclidean_cub":   "fc_conv_euclidean_cub_conv5_3_*.pt",
+    # Flowers – fc
+    "fc_hinge_flowers":        "fc_hinge_flowers_fc_*.pt",
+    "fc_euclidean_flowers":    "fc_euclidean_flowers_fc_*.pt",
+    # Flowers – conv
+    "conv_hinge_flowers":      "conv_hinge_flowers_conv5_3_*.pt",
+    # Flowers – fc+conv
+    "fc_conv_hinge_flowers":   "fc_conv_hinge_flowers_conv5_3_*.pt",
+    "fc_conv_euclidean_flowers": "fc_conv_euclidean_flowers_conv5_3_*.pt",
+
+    # ── Table 3: conv-layer ablation (CUB, fc+conv, BCE) ─────────────────
+    "fc_conv_bce_cub_conv4_3": "fc_conv_bce_cub_conv4_3_*.pt",
+    "fc_conv_bce_cub_conv5_3": "fc_conv_bce_cub_conv5_3_*.pt",
+    "fc_conv_bce_cub_pool5":   "fc_conv_bce_cub_pool5_*.pt",
+
+    # ── Table 4: supervised baseline (50/50 split, n_unseen=0) ────────────
+    "fc_bce_cub_5050":         "fc_bce_cub_fc_0_tr0.5.pt",
+    "fc_conv_bce_cub_5050":    "fc_conv_bce_cub_conv5_3_0_tr0.5.pt",
+    "fc_bce_flowers_5050":     "fc_bce_flowers_fc_0_tr0.5.pt",
+    "fc_conv_bce_flowers_5050": "fc_conv_bce_flowers_conv5_3_0_tr0.5.pt",
 }
 
 
-def resolve_checkpoint(explicit: str, checkpoint_dir: str, key: str) -> str:
-    """
-    Resolve checkpoint path with support for new detailed naming format (no timestamp).
+def _resolve_in_dir(directory: Path, key: str) -> str:
+    """Match a single checkpoint in *directory* using ``CHECKPOINT_PATTERNS``.
 
-    Resolution priority:
-    1. Explicit path (if provided and exists)
-    2. Scan checkpoint_dir for files matching pattern: {model_type}_{loss}_{dataset}_{layer}_{n_unseen}[_tr{ratio}].pt
-    3. Fallback to old CHECKPOINT_NAMES for backward compatibility
-
-    Returns empty string if not found.
+    Returns the path string, or empty string if not found.
+    For patterns with wildcards, prefers files WITHOUT ``_0_`` (non-50/50)
+    unless the key itself contains ``5050``.
     """
-    # 1. Try explicit path first
+    pattern = CHECKPOINT_PATTERNS.get(key)
+    if not pattern:
+        return ""
+
+    matches = list(directory.glob(pattern))
+    if not matches:
+        return ""
+
+    if len(matches) == 1:
+        return str(matches[0])
+
+    # Multiple matches (e.g. both _40.pt and _0_tr0.5.pt hit the wildcard).
+    # For 5050 keys, prefer the _0_ file; otherwise exclude it.
+    is_5050 = "5050" in key
+    if is_5050:
+        preferred = [f for f in matches if "_0_" in f.name]
+    else:
+        preferred = [f for f in matches if "_0_" not in f.name]
+
+    chosen = preferred if preferred else matches
+    chosen.sort(key=lambda p: p.name)
+    return str(chosen[0])
+
+
+def resolve_checkpoint(key: str, checkpoint_dir: str = "", explicit: str = "") -> str:
+    """Resolve a single checkpoint by key.
+
+    Resolution order:
+      1. *explicit* path (if given and exists)
+      2. Pattern match in *checkpoint_dir* (or DEFAULT_CHECKPOINT_DIR)
+
+    No fallback heuristics.
+    """
     if explicit:
         p = Path(explicit)
-        if p.is_absolute() and p.exists():
-            return str(p)
         if p.exists():
+            print(f"  [CKPT] {key} → {p} (explicit)")
             return str(p)
+        # Try relative to CODE_ROOT
+        p2 = CODE_ROOT / p
+        if p2.exists():
+            print(f"  [CKPT] {key} → {p2} (explicit)")
+            return str(p2)
 
-    # 2. Try to auto-detect from checkpoint_dir using pattern matching
-    dir_to_use = checkpoint_dir if checkpoint_dir else DEFAULT_CHECKPOINT_DIR
-    if dir_to_use:
-        base = Path(dir_to_use)
-        if not base.is_absolute():
-            base = CODE_ROOT / base
+    base = Path(checkpoint_dir) if checkpoint_dir else Path(DEFAULT_CHECKPOINT_DIR)
+    if not base.is_absolute():
+        base = CODE_ROOT / base
 
-        if base.exists() and base.is_dir():
-            # Define patterns for different model types (no timestamp in filename)
-            # Filename format: {model_type}_{loss}_{dataset}_{layer}_{n_unseen}[_tr{ratio}].pt
-            patterns = {
-                # fc models: must NOT be fc_conv, pattern includes "_fc_" (layer field)
-                "fc": ["fc_*_cub_fc_*.pt", "fc_*_flowers_fc_*.pt"],
-                # Flowers-only fc (prevents CUB checkpoint from being used for Flowers eval)
-                "fc_flowers": ["fc_*_flowers_fc_*.pt"],
-                # conv models: must NOT be fc_conv, pattern includes "_conv" (layer field)
-                "conv": ["conv_*_cub_conv4_3_*.pt", "conv_*_cub_conv5_3_*.pt", "conv_*_cub_pool5_*.pt",
-                        "conv_*_flowers_conv4_3_*.pt", "conv_*_flowers_conv5_3_*.pt", "conv_*_flowers_pool5_*.pt"],
-                # Flowers-only conv
-                "conv_flowers": ["conv_*_flowers_conv4_3_*.pt", "conv_*_flowers_conv5_3_*.pt", "conv_*_flowers_pool5_*.pt"],
-                # fc+conv models: must start with "fc_conv_", include specific conv layers
-                "fc_conv": ["fc_conv_*_cub_conv4_3_*.pt", "fc_conv_*_cub_conv5_3_*.pt", "fc_conv_*_cub_pool5_*.pt",
-                           "fc_conv_*_flowers_conv4_3_*.pt", "fc_conv_*_flowers_conv5_3_*.pt", "fc_conv_*_flowers_pool5_*.pt"],
-                # Flowers-only fc+conv
-                "fc_conv_flowers": ["fc_conv_*_flowers_conv4_3_*.pt", "fc_conv_*_flowers_conv5_3_*.pt", "fc_conv_*_flowers_pool5_*.pt"],
-                # loss functions: match fc models with specific loss (exclude fc_conv)
-                "bce": ["fc_bce_cub_*.pt", "fc_bce_flowers_*.pt"],
-                "hinge": ["fc_hinge_cub_*.pt", "fc_hinge_flowers_*.pt"],
-                "euclidean": ["fc_euclidean_cub_*.pt", "fc_euclidean_flowers_*.pt"],
-                # Dataset-specific BCE keys (prevent cross-dataset fold selection)
-                "fc_bce_cub":         ["fc_bce_cub_fc_*.pt"],
-                "conv_bce_cub":       ["conv_bce_cub_conv*.pt"],
-                "fc_conv_bce_cub":    ["fc_conv_bce_cub_conv*.pt"],
-                "fc_bce_flowers":     ["fc_bce_flowers_fc_*.pt"],
-                "conv_bce_flowers":   ["conv_bce_flowers_conv*.pt"],
-                "fc_conv_bce_flowers":["fc_conv_bce_flowers_conv*.pt"],
-                # Dataset-specific hinge/euclidean keys (prevent cross-dataset selection)
-                "fc_hinge_cub":            ["fc_hinge_cub_fc_*.pt"],
-                "fc_euclidean_cub":        ["fc_euclidean_cub_fc_*.pt"],
-                "fc_hinge_flowers":        ["fc_hinge_flowers_fc_*.pt"],
-                "fc_euclidean_flowers":    ["fc_euclidean_flowers_fc_*.pt"],
-                "conv_hinge_cub":          ["conv_hinge_cub_conv*.pt"],
-                "conv_euclidean_cub":      ["conv_euclidean_cub_conv*.pt"],
-                "conv_hinge_flowers":      ["conv_hinge_flowers_conv*.pt"],
-                "conv_euclidean_flowers":  ["conv_euclidean_flowers_conv*.pt"],
-                "fc_conv_hinge_cub":       ["fc_conv_hinge_cub_conv*.pt"],
-                "fc_conv_euclidean_cub":   ["fc_conv_euclidean_cub_conv*.pt"],
-                "fc_conv_hinge_flowers":   ["fc_conv_hinge_flowers_conv*.pt"],
-                "fc_conv_euclidean_flowers":["fc_conv_euclidean_flowers_conv*.pt"],
-                # per-model-type per-loss keys (cross-dataset, kept for backward compat)
-                "fc_bce": ["fc_bce_cub_fc_*.pt", "fc_bce_flowers_fc_*.pt"],
-                "fc_hinge": ["fc_hinge_cub_fc_*.pt", "fc_hinge_flowers_fc_*.pt"],
-                "fc_euclidean": ["fc_euclidean_cub_fc_*.pt", "fc_euclidean_flowers_fc_*.pt"],
-                "conv_bce": ["conv_bce_cub_conv*.pt", "conv_bce_flowers_conv*.pt"],
-                "conv_hinge": ["conv_hinge_cub_conv*.pt", "conv_hinge_flowers_conv*.pt"],
-                "conv_euclidean": ["conv_euclidean_cub_conv*.pt", "conv_euclidean_flowers_conv*.pt"],
-                "fc_conv_bce": ["fc_conv_bce_cub_conv*.pt", "fc_conv_bce_flowers_conv*.pt"],
-                "fc_conv_hinge": ["fc_conv_hinge_cub_conv*.pt", "fc_conv_hinge_flowers_conv*.pt"],
-                "fc_conv_euclidean": ["fc_conv_euclidean_cub_conv*.pt", "fc_conv_euclidean_flowers_conv*.pt"],
-                # specific layers (for both conv and fc+conv models)
-                "conv4_3": ["conv_*_cub_conv4_3_*.pt", "conv_*_flowers_conv4_3_*.pt",
-                            "fc_conv_*_cub_conv4_3_*.pt", "fc_conv_*_flowers_conv4_3_*.pt"],
-                "conv5_3": ["conv_*_cub_conv5_3_*.pt", "conv_*_flowers_conv5_3_*.pt",
-                            "fc_conv_*_cub_conv5_3_*.pt", "fc_conv_*_flowers_conv5_3_*.pt"],
-                "pool5": ["conv_*_cub_pool5_*.pt", "conv_*_flowers_pool5_*.pt",
-                          "fc_conv_*_cub_pool5_*.pt", "fc_conv_*_flowers_pool5_*.pt"],
-                # CUB-only fc+conv conv5_3 (Table 3: prevents Flowers or pure-conv from being selected)
-                "fc_conv_cub_conv5_3": ["fc_conv_*_cub_conv5_3_*.pt"],
-            }
-
-            # Get pattern list for this key (or use key as part of pattern)
-            pattern_list = patterns.get(key)
-            if pattern_list:
-                # Find all matching files across all patterns
-                matching_files = []
-                for pattern in pattern_list:
-                    matching_files.extend(base.glob(pattern))
-
-                if matching_files:
-                    # Prioritize non-50/50 files (exclude files with "_0_") for standard tables
-                    # Table 4 uses 50/50 split (n_unseen=0, train_ratio=0.5) which creates filenames with "_0_"
-                    standard_files = [f for f in matching_files if "_0_" not in f.name]
-
-                    def _prefix_score(p: Path) -> int:
-                        """Score a file by how long a prefix of `key` matches the start of its stem."""
-                        stem = p.stem
-                        for i in range(len(key), 0, -1):
-                            if stem.startswith(key[:i]):
-                                return i
-                        return 0
-
-                    if standard_files:
-                        # Sort by longest name-prefix match (descending), then alphabetically as tiebreaker
-                        standard_files.sort(key=lambda p: (-_prefix_score(p), p.name))
-                        return str(standard_files[0])
-                    else:
-                        # Fallback to all files if no standard files found (e.g., for Table 4)
-                        matching_files.sort(key=lambda p: (-_prefix_score(p), p.name))
-                        return str(matching_files[0])
-
-        # 3. Fallback to old naming scheme for backward compatibility
-        path = base / CHECKPOINT_NAMES.get(key, f"{key}.pt")
-        if path.exists():
-            return str(path)
-
-    # 4. Fallback: search fold{i}/ subdirectories and return the most recent match
-    if dir_to_use:
-        base = Path(dir_to_use)
-        if not base.is_absolute():
-            base = CODE_ROOT / base
-        fold_dirs = sorted(base.glob("fold*/"), key=lambda p: p.name)
-        for fold_dir in fold_dirs:
-            p = resolve_checkpoint("", str(fold_dir), key)
-            if p:
-                return p
+    if base.exists() and base.is_dir():
+        result = _resolve_in_dir(base, key)
+        if result:
+            print(f"  [CKPT] {key} → {Path(result).name}")
+        else:
+            print(f"  [CKPT] {key} → NOT FOUND (pattern: {CHECKPOINT_PATTERNS.get(key, '?')})")
+        return result
 
     return ""
 
 
 def resolve_cv_checkpoints(
     key: str,
-    n_folds: int,
+    n_folds: int = 0,
     checkpoint_dir: str = "",
-    explicit_paths: list[str] | None = None,
 ) -> list[str]:
-    """Return one checkpoint path per fold from ``checkpoints/fold{i}/``.
+    """Return per-fold checkpoint paths from ``fold{i}/`` subdirectories.
 
     Args:
-        key: Checkpoint key (e.g. ``"fc"``, ``"bce"``).
-        n_folds: Maximum number of folds to search (0 = auto-detect from dirs).
-        checkpoint_dir: Override for the checkpoints root directory.
-        explicit_paths: If provided, return these directly (bypass auto-detection).
+        key: Checkpoint key (e.g. ``"fc_bce_cub"``).
+        n_folds: Max folds to search (0 = auto-detect from ``fold*/`` dirs).
+        checkpoint_dir: Override for checkpoints root directory.
 
     Returns:
-        List of resolved checkpoint paths.  Empty strings mark missing folds.
-        May be shorter than ``n_folds`` when fewer fold directories exist.
+        List of resolved paths (only includes folds where a match was found).
     """
-    if explicit_paths:
-        return [p for p in explicit_paths if p]
-
-    dir_to_use = checkpoint_dir if checkpoint_dir else DEFAULT_CHECKPOINT_DIR
-    base = Path(dir_to_use)
+    base = Path(checkpoint_dir) if checkpoint_dir else Path(DEFAULT_CHECKPOINT_DIR)
     if not base.is_absolute():
         base = CODE_ROOT / base
 
     if not base.exists():
         return []
 
-    # Auto-detect available fold directories
     fold_dirs = sorted(base.glob("fold*/"), key=lambda p: p.name)
     if n_folds > 0:
         fold_dirs = fold_dirs[:n_folds]
 
     paths = []
     for fold_dir in fold_dirs:
-        p = resolve_checkpoint("", str(fold_dir), key)
-        if p:  # skip folds where the checkpoint is missing
+        p = _resolve_in_dir(fold_dir, key)
+        if p:
             paths.append(p)
 
+    if paths:
+        print(f"  [CKPT] {key} → {len(paths)} CV folds: {', '.join(Path(p).parent.name + '/' + Path(p).name for p in paths)}")
+
     return paths
+
+
+def resolve_with_cv(
+    key: str,
+    n_folds: int = 0,
+    checkpoint_dir: str = "",
+    explicit: str = "",
+) -> tuple[str, list[str]]:
+    """Resolve both root and per-fold checkpoints for a key.
+
+    Returns:
+        ``(root_path, fold_paths)`` — either or both may be empty.
+        Callers should prefer fold_paths (average across folds) when available,
+        falling back to root_path for single-run evaluation.
+    """
+    root = resolve_checkpoint(key, checkpoint_dir, explicit)
+    folds = resolve_cv_checkpoints(key, n_folds, checkpoint_dir)
+    return root, folds
 
 
 # Paper-style: single column ~3.3in, two-column figure ~6.6in; font ~9pt
@@ -408,7 +387,7 @@ def validate_data_path(cub_root: str, wikipedia_path: str, script_name: str = "S
     return True
 
 
-def get_device(device_arg: str) -> torch.device:
+def get_device(device_arg: str):
     """
     Get torch device with fallback.
     """

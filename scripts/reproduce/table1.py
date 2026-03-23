@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from data import ImageClassDataset, prepare_birds_zero_shot, prepare_flowers_zero_shot
-from scripts.reproduce.common import get_tables_dir, get_tex_dir, read_table_csv, resolve_checkpoint, resolve_cv_checkpoints, write_table_csv
+from scripts.reproduce.common import get_tables_dir, get_tex_dir, read_table_csv, resolve_checkpoint, resolve_cv_checkpoints, write_table_csv, resolve_with_cv
 from scripts.reproduce.eval_utils import (
     compute_zero_shot_metrics,
     evaluate_cv_folds,
@@ -40,9 +40,7 @@ def _fmt(x) -> str:
 
 
 def _best_across_losses(
-    loss_specs: list[tuple[str, str]],
-    fallback_ckpt: str,
-    fallback_cv_key: str,
+    loss_keys: list[str],
     model_type: str,
     loader,
     text_t,
@@ -57,47 +55,28 @@ def _best_across_losses(
 ) -> dict | None:
     """Evaluate per-loss checkpoints; return metrics from the best (highest roc_auc_mean).
 
-    For each (cv_key, single_ckpt) in loss_specs:
-      - If CV fold dirs exist for cv_key → evaluate_cv_folds (mean across folds, no std)
-      - Else if single_ckpt resolves → single checkpoint evaluation
-    Falls back to fallback_ckpt / fallback_cv_key when no loss_specs produce results.
-    This handles mixed scenarios: some losses with CV, some without.
+    For each key in loss_keys:
+      - If CV fold dirs exist → evaluate_cv_folds (mean across folds)
+      - Else if root checkpoint exists → single checkpoint evaluation
+    No fallback — if a key has no matching file it is skipped.
     """
-    best_m, best_score, tried_any = None, -1.0, False
+    best_m, best_score = None, -1.0
 
-    for cv_key, single_ckpt in loss_specs:
-        fold_ckpts = resolve_cv_checkpoints(cv_key, n_folds, checkpoint_dir)
+    for key in loss_keys:
+        root, fold_ckpts = resolve_with_cv(key, n_folds, checkpoint_dir)
         if len(fold_ckpts) >= 2:
-            tried_any = True
             m = evaluate_cv_folds(fold_ckpts, model_type, **cv_kw)
-        else:
-            resolved = resolve_checkpoint(single_ckpt, checkpoint_dir, cv_key)
-            if not resolved:
-                continue
-            tried_any = True
-            mdl = load_model(model_type, resolved, device, **model_kw)
+        elif root:
+            mdl = load_model(model_type, root, device, **model_kw)
             scores, labels = run_inference(
                 mdl, loader, text_t, device, num_classes,
-                desc=f"{model_type}/{cv_key}",
+                desc=f"{model_type}/{key}",
             )
             m = compute_zero_shot_metrics(scores, labels, seen_idx, unseen_idx)
+        else:
+            continue
         if m and m.get("roc_auc_mean", 0.0) > best_score:
             best_score, best_m = m["roc_auc_mean"], m
-
-    # Fall back to generic (non-loss-specific) checkpoint when no per-loss ckpt was found
-    if not tried_any:
-        fold_ckpts = resolve_cv_checkpoints(fallback_cv_key, n_folds, checkpoint_dir)
-        if len(fold_ckpts) >= 2:
-            best_m = evaluate_cv_folds(fold_ckpts, model_type, **cv_kw)
-        else:
-            resolved = resolve_checkpoint(fallback_ckpt, checkpoint_dir, fallback_cv_key)
-            if resolved:
-                mdl = load_model(model_type, resolved, device, **model_kw)
-                scores, labels = run_inference(
-                    mdl, loader, text_t, device, num_classes,
-                    desc=f"{model_type} inference",
-                )
-                best_m = compute_zero_shot_metrics(scores, labels, seen_idx, unseen_idx)
 
     return best_m
 
@@ -109,33 +88,7 @@ def main():
     parser.add_argument("--wikipedia_birds", type=str, default="data/wikipedia/birds.jsonl")
     parser.add_argument("--wikipedia_flowers", type=str, default="data/wikipedia/flowers.jsonl")
     parser.add_argument("--checkpoint_dir", type=str, default="", help="Default dir for checkpoints (e.g. checkpoints/); used when --checkpoint_* not set")
-    parser.add_argument("--checkpoint_fc", type=str, default="fc.pt")
-    parser.add_argument("--checkpoint_conv", type=str, default="conv.pt")
-    parser.add_argument("--checkpoint_fc_conv", type=str, default="fc_conv.pt")
-    # Flowers-specific checkpoints (trained on flowers data); fall back to CUB checkpoints if not set
-    parser.add_argument("--flowers_checkpoint_fc", type=str, default="", help="Flowers FC checkpoint (falls back to --checkpoint_fc if not set)")
-    parser.add_argument("--flowers_checkpoint_conv", type=str, default="", help="Flowers Conv checkpoint (falls back to --checkpoint_conv if not set)")
-    parser.add_argument("--flowers_checkpoint_fc_conv", type=str, default="", help="Flowers FC+Conv checkpoint (falls back to --checkpoint_fc_conv if not set)")
-    # Per-loss checkpoints (CUB) — paper reports best across objective functions
-    parser.add_argument("--checkpoint_fc_bce",        type=str, default="")
-    parser.add_argument("--checkpoint_fc_hinge",      type=str, default="")
-    parser.add_argument("--checkpoint_fc_euclidean",  type=str, default="")
-    parser.add_argument("--checkpoint_conv_bce",      type=str, default="")
-    parser.add_argument("--checkpoint_conv_hinge",    type=str, default="")
-    parser.add_argument("--checkpoint_conv_euclidean",type=str, default="")
-    parser.add_argument("--checkpoint_fc_conv_bce",      type=str, default="")
-    parser.add_argument("--checkpoint_fc_conv_hinge",    type=str, default="")
-    parser.add_argument("--checkpoint_fc_conv_euclidean",type=str, default="")
-    # Per-loss checkpoints (Flowers)
-    parser.add_argument("--flowers_checkpoint_fc_bce",        type=str, default="")
-    parser.add_argument("--flowers_checkpoint_fc_hinge",      type=str, default="")
-    parser.add_argument("--flowers_checkpoint_fc_euclidean",  type=str, default="")
-    parser.add_argument("--flowers_checkpoint_conv_bce",      type=str, default="")
-    parser.add_argument("--flowers_checkpoint_conv_hinge",    type=str, default="")
-    parser.add_argument("--flowers_checkpoint_conv_euclidean",type=str, default="")
-    parser.add_argument("--flowers_checkpoint_fc_conv_bce",      type=str, default="")
-    parser.add_argument("--flowers_checkpoint_fc_conv_hinge",    type=str, default="")
-    parser.add_argument("--flowers_checkpoint_fc_conv_euclidean",type=str, default="")
+    # Checkpoint directory — all checkpoints are auto-detected by key pattern
     parser.add_argument("--out_dir", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch_size", type=int, default=64)
@@ -147,6 +100,9 @@ def main():
                         help="Train/test split ratio used during training (default: 0.8, paper value)")
     parser.add_argument("--n_unseen", type=int, default=None,
                         help="Unseen classes used during training (default: 40 CUB / 20 Flowers)")
+    parser.add_argument("--conv_feature_layer", type=str, default=CONV_FEATURE_LAYER,
+                        choices=("conv5_3", "conv4_3", "pool5"),
+                        help="VGG conv feature layer used during training (default: conv5_3)")
     parser.add_argument("--image_backbone", type=str, default="vgg19",
                         choices=("vgg19", "densenet121", "resnet50"),
                         help="Image backbone used during training (default: vgg19)")
@@ -168,7 +124,7 @@ def main():
         ft_hidden=FT_HIDDEN,
         gv_hidden=GV_HIDDEN,
         conv_channels=CONV_CHANNELS,
-        conv_feature_layer=CONV_FEATURE_LAYER,
+        conv_feature_layer=args.conv_feature_layer,
         image_backbone=args.image_backbone,
     )
     # Reorganized table structure: Paper and Ours side-by-side for easy comparison
@@ -295,35 +251,14 @@ def main():
                     train_ratio=args.train_ratio,
                     **model_kw,
                 )
-                _loss_specs_cub = {
-                    # Use CUB-specific cv_keys to avoid selecting Flowers checkpoints
-                    "fc": [
-                        ("fc_bce_cub",       args.checkpoint_fc_bce),
-                        ("fc_hinge_cub",     args.checkpoint_fc_hinge),
-                        ("fc_euclidean_cub", args.checkpoint_fc_euclidean),
-                    ],
-                    "conv": [
-                        ("conv_bce_cub",       args.checkpoint_conv_bce),
-                        ("conv_hinge_cub",     args.checkpoint_conv_hinge),
-                        ("conv_euclidean_cub", args.checkpoint_conv_euclidean),
-                    ],
-                    "fc+conv": [
-                        ("fc_conv_bce_cub",       args.checkpoint_fc_conv_bce),
-                        ("fc_conv_hinge_cub",     args.checkpoint_fc_conv_hinge),
-                        ("fc_conv_euclidean_cub", args.checkpoint_fc_conv_euclidean),
-                    ],
-                }
-                _fallback_cub = {
-                    "fc":     (args.checkpoint_fc,      "fc"),
-                    "conv":   (args.checkpoint_conv,    "conv"),
-                    "fc+conv":(args.checkpoint_fc_conv, "fc_conv"),
+                _loss_keys_cub = {
+                    "fc":     ["fc_bce_cub", "fc_hinge_cub", "fc_euclidean_cub"],
+                    "conv":   ["conv_bce_cub", "conv_hinge_cub"],
+                    "fc+conv": ["fc_conv_bce_cub", "fc_conv_hinge_cub", "fc_conv_euclidean_cub"],
                 }
                 for model_type in tqdm(["fc", "conv", "fc+conv"], desc="CUB models", unit="model"):
-                    fallback_ckpt, fallback_cv_key = _fallback_cub[model_type]
                     m = _best_across_losses(
-                        loss_specs=_loss_specs_cub[model_type],
-                        fallback_ckpt=fallback_ckpt,
-                        fallback_cv_key=fallback_cv_key,
+                        loss_keys=_loss_keys_cub[model_type],
                         model_type=model_type,
                         loader=loader,
                         text_t=text_t,
@@ -378,38 +313,14 @@ def main():
                     train_ratio=args.train_ratio,
                     **model_kw,
                 )
-                # Flowers per-loss specs: Flowers-specific cv_keys only (prevents CUB checkpoint selection).
-                # Keys with no matching file return empty string → skipped gracefully.
-                _loss_specs_flowers = {
-                    "fc": [
-                        ("fc_bce_flowers",       args.flowers_checkpoint_fc_bce),
-                        ("fc_hinge_flowers",     args.flowers_checkpoint_fc_hinge),
-                        ("fc_euclidean_flowers", args.flowers_checkpoint_fc_euclidean),
-                    ],
-                    "conv": [
-                        ("conv_bce_flowers",       args.flowers_checkpoint_conv_bce),
-                        ("conv_hinge_flowers",     args.flowers_checkpoint_conv_hinge),
-                        ("conv_euclidean_flowers", args.flowers_checkpoint_conv_euclidean),
-                    ],
-                    "fc+conv": [
-                        ("fc_conv_bce_flowers",       args.flowers_checkpoint_fc_conv_bce),
-                        ("fc_conv_hinge_flowers",     args.flowers_checkpoint_fc_conv_hinge),
-                        ("fc_conv_euclidean_flowers", args.flowers_checkpoint_fc_conv_euclidean),
-                    ],
-                }
-                # Use Flowers-specific keys so auto-detection only finds flowers-trained checkpoints
-                # (prevents silent fallback to CUB-trained models which gives ~0.5 ROC-AUC on Flowers)
-                _fallback_flowers = {
-                    "fc":     (args.flowers_checkpoint_fc,      "fc_flowers"),
-                    "conv":   (args.flowers_checkpoint_conv,    "conv_flowers"),
-                    "fc+conv":(args.flowers_checkpoint_fc_conv, "fc_conv_flowers"),
+                _loss_keys_flowers = {
+                    "fc":     ["fc_bce_flowers", "fc_hinge_flowers", "fc_euclidean_flowers"],
+                    "conv":   ["conv_bce_flowers", "conv_hinge_flowers"],
+                    "fc+conv": ["fc_conv_bce_flowers", "fc_conv_hinge_flowers", "fc_conv_euclidean_flowers"],
                 }
                 for model_type in tqdm(["fc", "conv", "fc+conv"], desc="Flowers models", unit="model"):
-                    fallback_ckpt, fallback_cv_key = _fallback_flowers[model_type]
                     m = _best_across_losses(
-                        loss_specs=_loss_specs_flowers[model_type],
-                        fallback_ckpt=fallback_ckpt,
-                        fallback_cv_key=fallback_cv_key,
+                        loss_keys=_loss_keys_flowers[model_type],
                         model_type=model_type,
                         loader=loader,
                         text_t=text_t,

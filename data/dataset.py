@@ -25,6 +25,7 @@ from .text_processor import texts_to_tfidf
 from .text_sbert import texts_to_sbert
 from .text_sbert_multi import texts_to_sbert_multi
 from .text_clip import texts_to_clip
+from .text_clip_multi import texts_to_clip_multi
 
 
 import functools
@@ -157,11 +158,11 @@ def _find_class_image_dir(
         images_base / class_path.strip("/"),
         images_base / "birds" / class_path.strip("/"),
         images_base / "flowers" / class_path.strip("/"),
-        images_base / f"{idx:03d}.{class_name.replace(' ', '_')}" if isinstance(class_name, str) else ""
+        images_base / f"{idx:03d}.{class_name.replace(' ', '_')}",
     ]
 
     for cand in candidates:
-        if cand and cand.exists() and cand.is_dir():
+        if cand.exists() and cand.is_dir():
             return cand
     return None
 
@@ -214,6 +215,33 @@ def _collect_class_images(
 
 
 @functools.lru_cache(maxsize=32)
+def _load_from_json_cached(
+    json_path: str,
+    images_base: str,
+    verbose: bool = True,
+) -> tuple[tuple[str, ...], tuple[int, ...], dict[int, str], tuple[str, ...]]:
+    """Internal cached loader — returns immutable types so the cache stays clean."""
+    json_path_p = Path(json_path)
+    images_base_p = Path(images_base)
+
+    if verbose:
+        logger.info(f"Loading metadata from {json_path_p}...")
+
+    with open(json_path_p, encoding="utf-8") as f:
+        content = f.read()
+
+    data = _parse_json_objects(content)
+    paths, labels, class_texts, class_names = _collect_class_images(
+        data, images_base_p, verbose
+    )
+
+    sorted_ids = sorted(class_names.keys())
+    ordered_names = [class_names[i] for i in sorted_ids]
+
+    # Return immutable types for cache safety
+    return tuple(paths), tuple(labels), class_texts, tuple(ordered_names)
+
+
 def load_from_json(
     json_path: str | Path,
     images_base: str | Path,
@@ -222,7 +250,8 @@ def load_from_json(
     """
     Load images and text based on Wikipedia JSON file (highly robust extraction).
 
-    Uses functools.lru_cache for automatic caching with LRU eviction policy.
+    Cached internally; each call returns fresh mutable copies so callers
+    can safely modify the results without polluting the cache.
 
     Args:
         json_path: Path to JSON/JSONL file containing class metadata
@@ -236,32 +265,16 @@ def load_from_json(
             - class_texts: Dictionary mapping class ID to Wikipedia text
             - ordered_names: List of class names sorted by ID
     """
-    json_path = Path(json_path).resolve()
-    images_base = Path(images_base).resolve()
-
-    if verbose:
-        logger.info(f"Loading metadata from {json_path}...")
-
-    # Read file content
-    with open(json_path, encoding="utf-8") as f:
-        content = f.read()
-
-    # Parse JSON objects
-    data = _parse_json_objects(content)
-
-    # Collect images and metadata
-    paths, labels, class_texts, class_names = _collect_class_images(
-        data, images_base, verbose
+    key_json = str(Path(json_path).resolve())
+    key_images = str(Path(images_base).resolve())
+    paths, labels, class_texts, ordered_names = _load_from_json_cached(
+        key_json, key_images, verbose
     )
-
-    # Sort class names by idx to ensure consistent ordering
-    sorted_ids = sorted(class_names.keys())
-    ordered_names = [class_names[i] for i in sorted_ids]
-
-    return paths, labels, class_texts, ordered_names
+    # Return mutable copies so callers cannot pollute the cache
+    return list(paths), list(labels), dict(class_texts), list(ordered_names)
 
 
-_TEXT_ENCODER_CHOICES = ("tfidf", "sbert", "sbert_multi", "clip")
+_TEXT_ENCODER_CHOICES = ("tfidf", "sbert", "sbert_multi", "clip", "clip_multi")
 
 
 def _compute_text_features(ordered_texts: list[str], text_encoder: str) -> "np.ndarray":
@@ -286,6 +299,8 @@ def _compute_text_features(ordered_texts: list[str], text_encoder: str) -> "np.n
         features = texts_to_sbert_multi(ordered_texts)
     elif text_encoder == "clip":
         features = texts_to_clip(ordered_texts)
+    elif text_encoder == "clip_multi":
+        features = texts_to_clip_multi(ordered_texts)
     return features
 
 
@@ -302,12 +317,21 @@ class ZeroShotDataset(Dataset):
         n_unseen: int = 40,
         train_ratio: float = 0.8,
         seed: int = 42,
+        unseen_seed: int | None = None,
+        split_seed: int | None = None,
         transform=None,
         verbose: bool = None,
         text_encoder: str = "tfidf",
     ):
         self.mode = mode
         self.transform = transform or get_eval_transform()
+
+        # Dual-seed support matching preparation.py:
+        #   unseen_seed — controls the seen/unseen class partition
+        #   split_seed  — controls the train/test image split within seen classes
+        # When omitted, both default to `seed` for backward compatibility.
+        _unseen_seed = unseen_seed if unseen_seed is not None else seed
+        _split_seed = split_seed if split_seed is not None else seed
 
         # Only be verbose for the first dataset instance (train)
         is_verbose = verbose if verbose is not None else (mode == "train")
@@ -336,7 +360,7 @@ class ZeroShotDataset(Dataset):
         # preparation.py (which always works with 0-indexed directory IDs).
         n_classes = len(all_class_ids)
         positions = list(range(n_classes))
-        random.seed(seed)
+        random.seed(_unseen_seed)
         random.shuffle(positions)
 
         self.unseen_classes = sorted(all_class_ids[p] for p in positions[:n_unseen])
@@ -353,10 +377,10 @@ class ZeroShotDataset(Dataset):
             class_to_images[lbl].sort()
 
         # Select samples for this mode.
-        # Re-seed with the same seed so the train/test image split within each
-        # seen class is reproducible and matches prepare_*_zero_shot (split_seed).
+        # Use split_seed (independent from unseen_seed) so that the train/test
+        # image split matches prepare_*_zero_shot(split_seed=...).
         self.samples = []
-        random.seed(seed)
+        random.seed(_split_seed)
 
         if mode == "test_unseen":
             for cls in self.unseen_classes:

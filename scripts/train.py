@@ -3,6 +3,7 @@ Training loop — Ba et al. ICCV 2015 zero-shot CNN.
 
 Paper Sec 4 minibatch loss: sum only over classes present in the batch (U ≤ B),
 cost O(B×U). Supports BCE (Eq. 6), Hinge (Eq. 7), Euclidean (Sec 4.2.1).
+Euclidean = Hinge + L2 on embeddings (Sec 4.2.1); L2 penalty added for fc/fc+conv models.
 
 Extensions (non-paper, via CLI flags):
   --text_encoder    sbert | sbert_multi | clip   (default: tfidf)
@@ -58,6 +59,7 @@ from utils.config import (
 )
 from utils.losses import (
     get_criterion,
+    euclidean_loss,
     clip_contrastive_loss,
     center_alignment_loss,
     embedding_mse_loss,
@@ -75,6 +77,7 @@ def train_step(
     labels: torch.Tensor,
     device: torch.device,
     use_hinge: bool = False,
+    use_euclidean: bool = False,
     non_blocking: bool = False,
     use_clip_loss: bool = False,
     clip_weight: float = 0.1,
@@ -100,12 +103,13 @@ def train_step(
     Args:
         model: ZeroShotModel instance
         optimizer: Adam optimizer
-        criterion: Loss function (BCE or Hinge with SUM reduction)
+        criterion: Loss function (BCE, Hinge, or Euclidean with SUM reduction)
         images: [B,3,224,224] tensor
         text_features: [C_seen, text_dim] tensor (seen classes only, on device)
         labels: [B] tensor in [0, C_seen-1] (seen-subset indices, pre-remapped by caller)
         device: torch device
         use_hinge: Whether using hinge loss
+        use_euclidean: Whether using Euclidean embedding loss (Paper Sec 4.2.1)
         non_blocking: Whether to use async GPU transfer
         use_clip_loss: Whether to add CLIP-style contrastive loss (fc/fc+conv only)
         clip_weight: Weight for the CLIP contrastive loss term
@@ -122,8 +126,9 @@ def train_step(
     images = images.to(device, non_blocking=non_blocking)
     labels = labels.to(device, non_blocking=non_blocking)
 
-    # Always get embeddings when using alignment losses
-    return_embeddings = use_clip_loss or use_alignment or use_embedding_loss
+    # Euclidean (Sec 4.2.1) needs embeddings for distance computation.
+    # Also needed for auxiliary alignment losses.
+    return_embeddings = use_euclidean or use_clip_loss or use_alignment or use_embedding_loss
 
     if return_embeddings:
         all_scores, image_emb, text_emb = model(images, text_features, return_embeddings=True)
@@ -131,18 +136,27 @@ def train_step(
         all_scores = model(images, text_features)  # [B, C_all]
         image_emb, text_emb = None, None
 
-    # Extract only the columns for classes in this batch
+    # All losses operate on scores/embeddings over batch classes
     unique_classes, inverse = torch.unique(labels, return_inverse=True)
     batch_scores = all_scores[:, unique_classes]  # [B, U]
 
-    # BCE: I_ij ∈ {0,1}, Hinge: I_ij ∈ {+1,-1}
     num_classes = unique_classes.numel()
-    targets = torch.zeros(batch_scores.size(0), num_classes, device=batch_scores.device, dtype=batch_scores.dtype)
-    targets[torch.arange(batch_scores.size(0), device=batch_scores.device), inverse] = 1.0
-    if use_hinge:
-        targets = 2 * targets - 1  # Convert to {+1,-1}
 
-    loss = criterion(batch_scores, targets)
+    if use_euclidean and image_emb is not None and text_emb is not None:
+        # Direct Euclidean distance loss (Paper Sec 4.2.1):
+        # Positive pairs: minimize ||g_i - f_j||²
+        # Negative pairs: max(0, margin - ||g_i - f_j||)²
+        batch_text_emb = text_emb[unique_classes]  # [U, k]
+        targets = torch.zeros(batch_scores.size(0), num_classes, device=batch_scores.device, dtype=batch_scores.dtype)
+        targets[torch.arange(batch_scores.size(0), device=batch_scores.device), inverse] = 1.0
+        targets = 2 * targets - 1  # {+1, -1}
+        loss = euclidean_loss(image_emb, batch_text_emb, targets, margin=HINGE_MARGIN)
+    else:
+        targets = torch.zeros(batch_scores.size(0), num_classes, device=batch_scores.device, dtype=batch_scores.dtype)
+        targets[torch.arange(batch_scores.size(0), device=batch_scores.device), inverse] = 1.0
+        if use_hinge:
+            targets = 2 * targets - 1  # Convert to {+1,-1}
+        loss = criterion(batch_scores, targets)
 
     # Add CLIP contrastive loss
     if use_clip_loss and image_emb is not None and text_emb is not None:
@@ -233,7 +247,7 @@ def _run_one_fold(args, fold_seed: int, fold_idx: int, n_folds: int) -> dict:
         components = generate_filename_components(
             args.model_type, args.loss, args.dataset, args.conv_feature_layer, n_unseen,
             args.train_ratio, args.text_encoder, args.image_backbone,
-            args.use_clip_loss, args.clip_weight,
+            args.use_clip_loss, args.clip_weight, args.fc_mode,
         )
         log_path = Path("logs") / ("_".join(components) + ".csv")
 
@@ -391,6 +405,7 @@ def _run_one_fold(args, fold_seed: int, fold_idx: int, n_folds: int) -> dict:
         conv_feature_layer=args.conv_feature_layer,
         image_backbone=args.image_backbone,
         model_type=args.model_type,
+        fc_mode=args.fc_mode,
     ).to(device)
 
     # Learning rate selection (note: differs from paper for conv modes)
@@ -403,9 +418,17 @@ def _run_one_fold(args, fold_seed: int, fold_idx: int, n_folds: int) -> dict:
             f"This empirical adjustment helps conv convergence.)"
         )
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=effective_lr)
+    if args.loss.lower() == "euclidean" and args.model_type == "conv":
+        raise ValueError(
+            "Euclidean loss requires FC embeddings but model_type='conv' has none. "
+            "Use model_type='fc' or 'fc+conv', or switch to loss='bce'/'hinge'."
+        )
+
     criterion = get_criterion(args.loss, HINGE_MARGIN)
     use_hinge = args.loss.lower() == "hinge"
+    use_euclidean = args.loss.lower() == "euclidean"
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=effective_lr)
 
     # Pre-compute evaluation data (constant across epochs)
     seen_classes = train_dataset.seen_classes
@@ -436,6 +459,8 @@ def _run_one_fold(args, fold_seed: int, fold_idx: int, n_folds: int) -> dict:
         correct_top1 = 0
         correct_top5 = 0
         total = 0
+        n_eval_classes = eval_text_features.size(0)
+        top5_k = min(5, n_eval_classes)
         with torch.inference_mode():
             for batch in tqdm(loader, desc=f"  Evaluating {split_name}", position=position, leave=False, ncols=70, colour="blue", disable=True):
                 images = batch["image"].to(device, non_blocking=pin_memory)
@@ -443,7 +468,7 @@ def _run_one_fold(args, fold_seed: int, fold_idx: int, n_folds: int) -> dict:
                 remapped_labels = label_map_tensor[labels]
                 scores = model(images, eval_text_features)
                 _, pred_top1 = scores.max(1)
-                _, pred_top5 = scores.topk(5, dim=1)
+                _, pred_top5 = scores.topk(top5_k, dim=1)
                 correct_top1 += (pred_top1 == remapped_labels).sum().item()
                 correct_top5 += (pred_top5 == remapped_labels.unsqueeze(1)).any(dim=1).sum().item()
                 total += labels.size(0)
@@ -477,7 +502,7 @@ def _run_one_fold(args, fold_seed: int, fold_idx: int, n_folds: int) -> dict:
         components = generate_filename_components(
             args.model_type, args.loss, args.dataset, args.conv_feature_layer, n_unseen,
             args.train_ratio, args.text_encoder, args.image_backbone,
-            args.use_clip_loss, args.clip_weight,
+            args.use_clip_loss, args.clip_weight, args.fc_mode,
         )
         checkpoint_path = Path("checkpoints") / ("_".join(components) + ".pt")
 
@@ -558,6 +583,7 @@ def _run_one_fold(args, fold_seed: int, fold_idx: int, n_folds: int) -> dict:
             loss = train_step(
                 model, optimizer, criterion, images, text_features_seen, labels_seen, device,
                 use_hinge=use_hinge,
+                use_euclidean=use_euclidean,
                 non_blocking=pin_memory,
                 use_clip_loss=args.use_clip_loss,
                 clip_weight=args.clip_weight,
@@ -655,13 +681,25 @@ def _run_one_fold(args, fold_seed: int, fold_idx: int, n_folds: int) -> dict:
                 logger.warning("No best model state found, skipping restoration")
                 break
 
-    # Save checkpoint
+    # Save checkpoint with training config metadata
+    config_meta = {
+        "text_dim": text_input_dim,
+        "k": args.k,
+        "ft_hidden": args.ft_hidden,
+        "gv_hidden": args.gv_hidden,
+        "conv_channels": args.conv_channels,
+        "conv_feature_layer": args.conv_feature_layer,
+        "image_backbone": args.image_backbone,
+        "model_type": args.model_type,
+        "text_encoder": args.text_encoder,
+        "fc_mode": args.fc_mode,
+    }
     if early_stopping_enabled and best_model_state is not None:
-        torch.save(best_model_state, checkpoint_path)
+        torch.save({"state_dict": best_model_state, "config": config_meta}, checkpoint_path)
         metric_name = "test_top1" if is_full_dataset else "unseen_top1"
         logger.info(f"Best checkpoint saved to {checkpoint_path} (epoch {best_epoch}, {metric_name}={best_metric*100:5.1f}%)")
     else:
-        torch.save(model.state_dict(), checkpoint_path)
+        torch.save({"state_dict": model.state_dict(), "config": config_meta}, checkpoint_path)
         logger.info(f"Checkpoint saved to {checkpoint_path}")
         # When early stopping disabled, record final-epoch metrics as "best"
         if best_epoch == 0:
@@ -731,7 +769,7 @@ def main():
 
     # ── Text encoding ─────────────────────────────────────────────────────
     parser.add_argument("--text_encoder", default=TEXT_ENCODER,
-                        choices=("tfidf", "sbert", "sbert_multi", "clip"),
+                        choices=("tfidf", "sbert", "sbert_multi", "clip", "clip_multi"),
                         help="[paper: tfidf] text feature extractor")
     parser.add_argument("--text_dim", type=int, default=-1,
                         help="Text feature dim (auto-detected from dataset when -1)")
@@ -740,6 +778,11 @@ def main():
     parser.add_argument("--image_backbone", default=IMAGE_BACKBONE,
                         choices=("vgg19", "densenet121", "resnet50"),
                         help="[paper: vgg19] image backbone; conv/fc+conv require vgg19")
+    parser.add_argument("--fc_mode", default="default",
+                        choices=("default", "penultimate"),
+                        help="[extension] FC branch mode for DenseNet/ResNet: "
+                             "'default' uses classifier head (1000-d), "
+                             "'penultimate' skips it (1024/2048-d). Ignored for VGG-19.")
 
     # ── Training ──────────────────────────────────────────────────────────
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE,

@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from data import ImageClassDataset, prepare_birds_zero_shot
-from scripts.reproduce.common import get_tables_dir, get_tex_dir, read_table_csv, resolve_checkpoint, resolve_cv_checkpoints, write_table_csv
+from scripts.reproduce.common import get_tables_dir, get_tex_dir, read_table_csv, resolve_with_cv, write_table_csv
 from scripts.reproduce.eval_utils import (
     compute_zero_shot_metrics,
     evaluate_cv_folds,
@@ -64,6 +64,9 @@ def main():
                         help="Train/test split ratio used during training (default: 0.8, paper value)")
     parser.add_argument("--n_unseen", type=int, default=None,
                         help="Unseen classes used during training (default: 40 for CUB)")
+    parser.add_argument("--conv_feature_layer", type=str, default=CONV_FEATURE_LAYER,
+                        choices=("conv5_3", "conv4_3", "pool5"),
+                        help="VGG conv feature layer used during training (default: conv5_3)")
     parser.add_argument("--image_backbone", type=str, default="vgg19",
                         choices=("vgg19", "densenet121", "resnet50"),
                         help="Image backbone used during training (default: vgg19)")
@@ -85,7 +88,7 @@ def main():
         ft_hidden=FT_HIDDEN,
         gv_hidden=GV_HIDDEN,
         conv_channels=CONV_CHANNELS,
-        conv_feature_layer=CONV_FEATURE_LAYER,
+        conv_feature_layer=args.conv_feature_layer,
         image_backbone=args.image_backbone,
     )
 
@@ -174,7 +177,7 @@ def main():
                 (args.checkpoint_euclidean, "fc_euclidean_cub", "Ours (Euclidean)"),
             ]
             for explicit_ckpt, cv_key, col_name in tqdm(models_to_eval, desc="Loss functions", unit="model"):
-                fold_ckpts = resolve_cv_checkpoints(cv_key, args.n_folds, args.checkpoint_dir)
+                root, fold_ckpts = resolve_with_cv(cv_key, args.n_folds, args.checkpoint_dir, explicit_ckpt)
                 if len(fold_ckpts) >= 2:
                     print(f"  {col_name}: averaging {len(fold_ckpts)} CV folds (per-fold split)")
                     m = evaluate_cv_folds(
@@ -191,7 +194,7 @@ def main():
                         **model_kw,
                     )
                 else:
-                    ckpt = resolve_checkpoint(explicit_ckpt, args.checkpoint_dir, cv_key)
+                    ckpt = root
                     if not ckpt:
                         continue
                     model = load_model("fc", ckpt, device, **model_kw)

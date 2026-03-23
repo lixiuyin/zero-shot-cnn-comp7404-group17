@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from data import ImageClassDataset, prepare_birds_zero_shot
 from data.text_processor import texts_to_tfidf
-from scripts.reproduce.common import FIG_DPI, FIG_TWO_COL_INCH, get_figures_dir, resolve_checkpoint
+from scripts.reproduce.common import FIG_DPI, FIG_TWO_COL_INCH, get_figures_dir, resolve_checkpoint as _resolve_checkpoint
 from scripts.reproduce.eval_utils import load_model
 from utils.config import (
     CONV_CHANNELS,
@@ -51,8 +51,16 @@ def main():
     parser.add_argument("--out_dir", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--n_unseen_show", type=int, default=3, help="Number of unseen classes to plot (left panel)")
+    parser.add_argument("--n_unseen_show", type=int, default=3, help="Number of unseen classes to plot (left panel, ignored if --classes is set)")
+    parser.add_argument("--classes", type=str, nargs="+", default=None,
+                        help="Class names to plot. If not set, picks the 3 unseen classes with largest max word sensitivity drop.")
     parser.add_argument("--max_words_ablate", type=int, default=0, help="Max TF-IDF dims to try per class (0 = all non-zero, as in paper)")
+    parser.add_argument("--conv_feature_layer", type=str, default=CONV_FEATURE_LAYER,
+                        choices=("conv5_3", "conv4_3", "pool5"),
+                        help="VGG conv feature layer used during training (default: conv5_3)")
+    parser.add_argument("--image_backbone", type=str, default="vgg19",
+                        choices=("vgg19", "densenet121", "resnet50"),
+                        help="Image backbone used during training (default: vgg19)")
     args = parser.parse_args()
 
     figures_dir = get_figures_dir()
@@ -68,11 +76,12 @@ def main():
         ft_hidden=FT_HIDDEN,
         gv_hidden=GV_HIDDEN,
         conv_channels=CONV_CHANNELS,
-        conv_feature_layer=CONV_FEATURE_LAYER,
+        conv_feature_layer=args.conv_feature_layer,
+        image_backbone=args.image_backbone,
     )
 
     jsonl_birds = code_root / args.wikipedia_birds
-    checkpoint_fc = resolve_checkpoint(args.checkpoint_fc, args.checkpoint_dir, "fc")
+    checkpoint_fc = _resolve_checkpoint("fc_bce_cub", args.checkpoint_dir, args.checkpoint_fc)
     if not args.cub_root or not Path(args.cub_root).exists() or not jsonl_birds.exists() or not checkpoint_fc:
         print("Provide --cub_root, --checkpoint_fc or --checkpoint_dir (and ensure wikipedia jsonl exists) to compute Figure 2.")
         return
@@ -129,18 +138,43 @@ def main():
     f_all = model.text_encoder(text_t).detach().cpu().numpy()
     print()  # Add newline for cleaner output
 
-    # Left panel: word sensitivity for first n_unseen_show unseen classes
-    unseen_show = unseen_idx[: args.n_unseen_show]
-    classes_left = [class_names[c] for c in unseen_show]
-    words_per_class = []
-    drops_per_class = []
-    pr_aucs_per_class = []
+    # Left panel: word sensitivity
+    unseen_set = set(unseen_idx.tolist()) if hasattr(unseen_idx, 'tolist') else set(unseen_idx)
+    if args.classes:
+        # Use specified classes
+        unseen_show = []
+        for target in args.classes:
+            target_lower = target.lower().replace(" ", "_")
+            found = False
+            for idx in range(len(class_names)):
+                name_part = class_names[idx].split(".", 1)[-1].lower()
+                if name_part == target_lower:
+                    if idx not in unseen_set:
+                        print(f"Note: class '{target}' (idx={idx}) is a SEEN class.")
+                    unseen_show.append(idx)
+                    found = True
+                    break
+            if not found:
+                print(f"Warning: class '{target}' not found in class_names, skipping.")
+        if not unseen_show:
+            print("Error: no matching classes to plot. Exiting.")
+            return
+        classes_to_analyze = np.array(unseen_show, dtype=int)
+    else:
+        # Analyze ALL unseen classes, then pick top 3 by max word sensitivity drop
+        classes_to_analyze = unseen_idx
 
-    for c in tqdm(unseen_show, desc="Analyzing words", unit="class", leave=True):
+    # Compute word sensitivity for each class
+    all_words = {}
+    all_drops = {}
+    all_pr_aucs = {}
+    all_max_drop = {}
+
+    for c in tqdm(classes_to_analyze, desc="Analyzing words", unit="class", leave=True):
         orig_vec = text_feat[c].copy()
         orig_norm = np.linalg.norm(orig_vec)
         pr_baseline = _pr_auc_class(scores_full, labels_full, c)
-        pr_aucs_per_class.append(pr_baseline)
+        all_pr_aucs[c] = pr_baseline
         non_zero = np.where(orig_vec != 0)[0]
         if args.max_words_ablate > 0 and len(non_zero) > args.max_words_ablate:
             non_zero = non_zero[np.argsort(-np.abs(orig_vec[non_zero]))[: args.max_words_ablate]]
@@ -164,8 +198,24 @@ def main():
         drops.sort(key=lambda x: -x[1])
         top5_words = [d[2] for d in drops[:5]]
         top5_drops = [d[1] for d in drops[:5]]
-        words_per_class.append(top5_words)
-        drops_per_class.append(top5_drops)
+        all_words[c] = top5_words
+        all_drops[c] = top5_drops
+        all_max_drop[c] = top5_drops[0] if top5_drops else 0.0
+
+    # Select classes to plot
+    if args.classes:
+        unseen_show = classes_to_analyze
+    else:
+        # Pick top 3 unseen classes by largest max word sensitivity drop
+        ranked = sorted(all_max_drop.keys(), key=lambda c: -all_max_drop[c])
+        unseen_show = np.array(ranked[: args.n_unseen_show], dtype=int)
+        print(f"Top {len(unseen_show)} unseen classes by max drop: "
+              + ", ".join(f"{class_names[c].split('.', 1)[-1]} (drop={all_max_drop[c]:.4f})" for c in unseen_show))
+
+    classes_left = [class_names[c] for c in unseen_show]
+    words_per_class = [all_words[c] for c in unseen_show]
+    drops_per_class = [all_drops[c] for c in unseen_show]
+    pr_aucs_per_class = [all_pr_aucs[c] for c in unseen_show]
 
     # Right panel: within-class and overall nearest neighbors
     nn_per_class = []
@@ -177,7 +227,10 @@ def main():
             within_idx = np.where(within_mask)[0][np.argmax(dots[within_mask])]
         else:
             within_idx = None
-        top_overall = np.argsort(-dots)[:3]
+        # Overall NNs: exclude same-class images
+        other_mask = labels_full != c
+        other_indices = np.where(other_mask)[0]
+        top_overall = other_indices[np.argsort(-dots[other_mask])[:3]]
         nn_per_class.append((c, within_idx, top_overall))
 
     # Plot
@@ -266,17 +319,15 @@ def main():
         if within_idx is not None:
             img = Image.open(test_p[within_idx]).convert("RGB")
             ax.imshow(img)
-            ax.set_xlabel(_clean_name(class_names[labels_full[within_idx]]),
-                          fontsize=5, labelpad=2)
         else:
             ax.text(0.5, 0.5, "N/A", ha="center", va="center", fontsize=8, color="gray")
+        # Class name below within-class image (no redundant label)
+        ax.set_xlabel(_clean_name(class_names[c]), fontsize=8, fontweight="bold", labelpad=4)
         ax.set_xticks([])
         ax.set_yticks([])
         for spine in ax.spines.values():
             spine.set_linewidth(0.5)
             spine.set_color("#CCCCCC")
-        ax.set_ylabel(_clean_name(class_names[c]), fontsize=7, fontweight="bold",
-                       rotation=0, labelpad=60, va="center")
 
         # Overall nearest neighbors
         for col_j, img_idx in enumerate(top_overall):
@@ -284,7 +335,7 @@ def main():
             img = Image.open(test_p[img_idx]).convert("RGB")
             ax.imshow(img)
             ax.set_xlabel(_clean_name(class_names[labels_full[img_idx]]),
-                          fontsize=5, labelpad=2)
+                          fontsize=8, labelpad=4)
             ax.set_xticks([])
             ax.set_yticks([])
             for spine in ax.spines.values():
@@ -292,8 +343,8 @@ def main():
                 spine.set_color("#CCCCCC")
 
     fig.suptitle(
-        "[LEFT] Word sensitivities of unseen classes (fc model, CUB-200-2011)\n"
-        "[RIGHT] Text features describing visual features (nearest neighbors)",
+        "[LEFT] Word sensitivities of unseen classes using the fc model on CUB200-2010.\n"
+        "[RIGHT] The Wikipedia article for each class is projected onto its feature vector and the nearest image neighbors from the test-set (in terms of maximal dot product) are shown",
         ha="center", va="bottom", fontsize=9, y=0.01
     )
     out_path = figures_dir / "Figure2.png"

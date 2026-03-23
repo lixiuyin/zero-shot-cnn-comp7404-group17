@@ -39,6 +39,7 @@ def generate_filename_components(
     image_backbone: str = "vgg19",
     use_clip_loss: bool = False,
     clip_weight: float = 0.1,
+    fc_mode: str = "default",
 ) -> list[str]:
     """Generate filename components encoding the full training configuration.
 
@@ -56,6 +57,7 @@ def generate_filename_components(
         image_backbone:     "vgg19" | "densenet121" | "resnet50"
         use_clip_loss:      Whether auxiliary CLIP contrastive loss is active
         clip_weight:        CLIP loss weight λ (only encoded when use_clip_loss=True)
+        fc_mode:            "default" | "penultimate" (DenseNet/ResNet fc branch mode)
 
     Returns:
         List of string components to join with "_".
@@ -85,6 +87,10 @@ def generate_filename_components(
     # Image backbone (paper default: vgg19)
     if image_backbone and image_backbone != "vgg19":
         components.append(f"bb{image_backbone}")
+
+    # FC mode (default: "default" = use classifier head)
+    if fc_mode and fc_mode != "default":
+        components.append(f"fc{fc_mode}")
 
     # CLIP contrastive loss
     if use_clip_loss:

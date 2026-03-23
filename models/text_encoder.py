@@ -25,9 +25,9 @@ class TextEncoder(nn.Module):
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, output_dim)
 
-        # Initialization strategy (best practices):
-        # - fc1 (hidden layer): Use Kaiming Uniform (PyTorch default) - optimal for ReLU
-        # - fc2 (weight prediction): Small initialization to prevent large predicted weights
+        # Initialization:
+        # - fc1: Kaiming Uniform (PyTorch default) - optimal for ReLU
+        # - fc2 (projection): small init so initial scores g @ f.T ≈ 0
         nn.init.normal_(self.fc2.weight, mean=0.0, std=0.01)
         nn.init.constant_(self.fc2.bias, 0.0)
 
@@ -36,6 +36,7 @@ class TextEncoder(nn.Module):
         h = torch.relu(self.fc1(x))
         return self.fc2(h)
 
-    def forward_hidden(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [*, p] -> [*, hidden_dim]. Used to predict conv filters (Sec 3.3)."""
-        return torch.relu(self.fc1(x))
+    def forward_with_hidden(self, x: torch.Tensor):
+        """x: [*, p] -> ([*, k], [*, hidden_dim]). Shares fc1 for both branches."""
+        h = torch.relu(self.fc1(x))
+        return self.fc2(h), h

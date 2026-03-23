@@ -17,11 +17,12 @@ from .text_processor import texts_to_tfidf
 from .text_sbert import texts_to_sbert
 from .text_sbert_multi import texts_to_sbert_multi
 from .text_clip import texts_to_clip
+from .text_clip_multi import texts_to_clip_multi
 
 
 def _get_text_features(ordered_texts: list[str], text_encoder: str) -> np.ndarray:
     """Dispatch text encoding based on encoder name."""
-    _choices = ("tfidf", "sbert", "sbert_multi", "clip")
+    _choices = ("tfidf", "sbert", "sbert_multi", "clip", "clip_multi")
     if text_encoder not in _choices:
         raise ValueError(f"text_encoder must be one of {_choices}; got {text_encoder!r}.")
     if text_encoder == "tfidf":
@@ -32,6 +33,8 @@ def _get_text_features(ordered_texts: list[str], text_encoder: str) -> np.ndarra
         features = texts_to_sbert_multi(ordered_texts)
     elif text_encoder == "clip":
         features = texts_to_clip(ordered_texts)
+    elif text_encoder == "clip_multi":
+        features = texts_to_clip_multi(ordered_texts)
     return features
 
 

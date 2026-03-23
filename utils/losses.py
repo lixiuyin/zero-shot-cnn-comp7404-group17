@@ -2,8 +2,9 @@
 Losses from Ba et al. ICCV 2015 Sec 4: BCE (Eq. 6), Hinge (Eq. 7), Euclidean (Sec 4.2.1).
 - Eq. 6: L = sum_ij [ I_ij log sigma(yhat) + (1-I_ij) log(1-sigma(yhat)) ], I in {0,1}, sigma sigmoid.
 - Eq. 7: L = sum_ij max(0, margin - I_ij * yhat), I in {+1,-1}, margin = 1.
-- Euclidean (Sec 4.2.1): in (g,f) space -1/2||g-f||^2 = g'f - 1/2||g||^2 - 1/2||f||^2; paper compares BCE/Hinge/Euclidean.
-  We expose Euclidean via MSE(scores, targets) with 0/1 targets (same interface as BCE).
+- Euclidean (Sec 4.2.1): hinge loss + L2 on embeddings.
+  Paper: -1/2||a-b||^2 = a'b - 1/2||a||^2 - 1/2||b||^2; hinge + L2(w_c, g_v)
+  is equivalent to minimizing Euclidean distance ||w_c - g_v(x)||^2.
 Minibatch per paper: sum only over (i,j) for images and classes in the batch; train_step passes [B,U].
 """
 from __future__ import annotations
@@ -58,20 +59,52 @@ def hinge_loss(
     return F.relu(margin - targets * scores).sum()
 
 
-def euclidean_loss(scores: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    """Euclidean-style loss (Sec 4.2.1).
+def euclidean_loss(
+    image_emb: torch.Tensor,
+    text_emb: torch.Tensor,
+    targets: torch.Tensor,
+    margin: float = 1.0,
+) -> torch.Tensor:
+    """Direct Euclidean distance loss (Paper Sec 4.2.1).
 
-    Computes MSE(scores, targets). Paper uses SUM (not mean) to be consistent
-    with BCE and Hinge losses.
+    Paper motivation: minimize ||w_c - g_v(x)||² for correct (image, class)
+    pairs, maximize distance for incorrect pairs.
+
+    Direct implementation using pairwise Euclidean distances, avoiding the
+    hinge+L2 decomposition which suffers from parasitic L2 penalty on
+    satisfied pairs (pushing embeddings to zero).
+
+    Contrastive formulation:
+        Positive pairs (I=+1): L = ||g_i - f_j||²  (pull together)
+        Negative pairs (I=-1): L = max(0, margin - ||g_i - f_j||)²  (push apart)
 
     Args:
-        scores: Predicted logits [N, C].
-        targets: Binary targets [N, C] with values in {0, 1}.
+        image_emb: Image embeddings [B, k] from g_v(·).
+        text_emb: Batch-class text embeddings [U, k] from f_t(·).
+        targets: Binary targets [B, U] with values in {+1, -1}.
+        margin: Distance margin for negative pairs (default 1.0).
 
     Returns:
-        Scalar loss (sum over all elements).
+        Scalar loss (sum over all pairs).
     """
-    return F.mse_loss(scores, targets.float(), reduction="sum")
+    # Pairwise squared Euclidean distances [B, U]
+    # ||g_i - f_j||² = ||g_i||² - 2*g_i^T*f_j + ||f_j||²
+    dist_sq = (image_emb.pow(2).sum(dim=1, keepdim=True)   # [B, 1]
+               - 2 * (image_emb @ text_emb.T)               # [B, U]
+               + text_emb.pow(2).sum(dim=1).unsqueeze(0))    # [1, U]
+    dist_sq = dist_sq.clamp(min=0.0)  # numerical safety
+
+    pos_mask = (targets > 0).float()   # [B, U]
+    neg_mask = (targets < 0).float()   # [B, U]
+
+    # Positive: minimize squared distance (pull correct class closer)
+    loss_pos = (dist_sq * pos_mask).sum()
+
+    # Negative: push apart if closer than margin
+    dist = dist_sq.sqrt()
+    loss_neg = (F.relu(margin - dist).pow(2) * neg_mask).sum()
+
+    return loss_pos + loss_neg
 
 
 def get_criterion(loss_name: str = "bce", hinge_margin: float = 1.0):
@@ -83,6 +116,7 @@ def get_criterion(loss_name: str = "bce", hinge_margin: float = 1.0):
 
     Returns:
         Loss function that takes (scores, targets) and returns scalar loss.
+        For 'euclidean', returns hinge criterion (L2 added separately in train_step).
 
     Raises:
         ValueError: If loss_name is not recognized.
@@ -92,7 +126,8 @@ def get_criterion(loss_name: str = "bce", hinge_margin: float = 1.0):
     if loss_name.lower() == "hinge":
         return lambda s, t: hinge_loss(s, t, margin=hinge_margin)
     if loss_name.lower() == "euclidean":
-        return lambda s, t: euclidean_loss(s, t)
+        # Direct Euclidean distance loss; handled entirely in train_step.
+        return None
     raise ValueError(f"Unknown loss: {loss_name}")
 
 

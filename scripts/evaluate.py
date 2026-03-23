@@ -101,11 +101,14 @@ def main():
                         help="Optional explicit path to Wikipedia JSONL (overrides default)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--text_encoder", default=TEXT_ENCODER,
-                        choices=("tfidf", "sbert", "sbert_multi", "clip"),
+                        choices=("tfidf", "sbert", "sbert_multi", "clip", "clip_multi"),
                         help="Text feature extractor — must match training setting")
     parser.add_argument("--image_backbone", default=IMAGE_BACKBONE,
                         choices=("vgg19", "densenet121", "resnet50"),
                         help="Image backbone — must match training setting")
+    parser.add_argument("--fc_mode", default="default",
+                        choices=("default", "penultimate"),
+                        help="FC branch mode — must match training setting")
     args = parser.parse_args()
     set_seed(42)  # Reproducible evaluation (same data split and any RNG in model)
     device = torch.device(args.device)
@@ -208,9 +211,14 @@ def main():
         conv_feature_layer=args.conv_feature_layer,
         image_backbone=args.image_backbone,
         model_type=args.model_type,
+        fc_mode=args.fc_mode,
     ).to(device)
     if args.checkpoint:
-        model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+        ckpt = torch.load(args.checkpoint, map_location=device)
+        if isinstance(ckpt, dict) and "state_dict" in ckpt:
+            model.load_state_dict(ckpt["state_dict"])
+        else:
+            model.load_state_dict(ckpt)
     model.eval()
 
     def _run_split(loader, split_name: str, eval_text_features: torch.Tensor, label_map_tensor: torch.Tensor):

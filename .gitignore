@@ -7,12 +7,26 @@ wheels/
 *.egg-info
 
 # Virtual environments
-.venv/
-.env/
-venv/
+.venv
+
+# Code Agents
+.claude
+.omc
+.ruff_cache
 
 # macOS
 *.DS_Store
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+wheels/
+
+# Virtual environments
+.venv/
+.env/
+venv/
 
 # Editor / IDE
 .vscode/
@@ -23,17 +37,18 @@ venv/
 tmp/
 .pytest_cache/
 
-# Images dataset
 data/images/
 
 # Checkpoints
 checkpoints/
 
-# LaTeX results
+# tex
 results/tex/*.log
 results/tex/*.aux
 results/*.log
 results/*.aux
+.swp
+.swo
 
 # Paper
 Paper/

@@ -13,6 +13,7 @@ from .text_processor import texts_to_tfidf
 from .text_sbert import texts_to_sbert
 from .text_sbert_multi import texts_to_sbert_multi
 from .text_clip import texts_to_clip
+from .text_clip_multi import texts_to_clip_multi
 
 __all__ = [
     "ZeroShotDataset",
@@ -27,4 +28,5 @@ __all__ = [
     "texts_to_sbert",
     "texts_to_sbert_multi",
     "texts_to_clip",
+    "texts_to_clip_multi",
 ]

@@ -2,15 +2,18 @@
 Image encoder (Ba et al. ICCV 2015 Sec 3.2 & 3.3), extended with multiple backbones.
 
 fc branch gv(·):
-  - vgg19      : VGG-19 fc1 (4096-d) → 4096-gv_hidden-k
-  - densenet121: global avg pool (1024-d) → 1024-gv_hidden-k
-  - resnet50   : global avg pool (2048-d) → 2048-gv_hidden-k
+  - vgg19      : VGG-19 fc2 (4096-d, the last 4096-d hidden layer) → 4096-gv_hidden-k
+  - densenet121: full network → avg pool (1024-d) → classifier (1000-d) → 1000-gv_hidden-k
+  - resnet50   : full network → avg pool (2048-d) → fc (1000-d) → 1000-gv_hidden-k
 
 conv branch g'_v(·): supported for all three backbones.
-  feature map → K' filters 3×3; spatial resolution 14×14 for all.
+  feature map → conv_reduce (d→K') → [B, K', H, W]; predicted filters [C, K', 3, 3] applied externally.
   - vgg19:       conv_feature_layer ("conv5_3" 512×14×14, "conv4_3" 512×28×28, "pool5" 512×7×7)
   - densenet121: after denseblock3 (1024×14×14), conv_feature_layer ignored
   - resnet50:    after layer3 (1024×14×14), conv_feature_layer ignored
+
+When both branches are used (fc+conv), the shared convolutional prefix is computed
+only once via forward_both().
 
 All pretrained weights are frozen (no fine-tuning), matching the paper spirit.
 """
@@ -37,8 +40,11 @@ _BACKBONE_CHOICES = ("vgg19", "densenet121", "resnet50")
 class ImageEncoder(nn.Module):
     """Image encoder supporting VGG19 / DenseNet121 / ResNet50 backbones.
 
-    The fc branch is available for all three backbones.
-    The conv branch (forward_conv_feature) is only available for backbone='vgg19'.
+    The fc branch and conv branch are both available for all three backbones.
+
+    Architecture (shared prefix avoids redundant computation):
+      features_shared  →  conv branch: conv_reduce (d→K') → [B, K', H, W]
+                       →  fc branch:   features_fc_suffix → flatten → fc_branch → projection → [B, k]
     """
 
     def __init__(
@@ -48,25 +54,26 @@ class ImageEncoder(nn.Module):
         conv_channels: int = 5,
         conv_feature_layer: str = "conv5_3",
         backbone: str = "vgg19",
+        fc_mode: str = "default",
     ):
         """
         Args:
             output_dim: Output dimension k for joint embedding.
             gv_hidden: Hidden dimension for the fc projection branch.
-            conv_channels: Number of predicted conv filters K' (VGG-19 only).
+            conv_channels: Number of predicted conv filters K'.
             conv_feature_layer: VGG-19 layer for conv branch ('conv5_3', 'conv4_3', 'pool5').
             backbone: One of 'vgg19', 'densenet121', 'resnet50'.
+            fc_mode: FC branch mode for DenseNet/ResNet (ignored for VGG-19):
+                - "default": pass through pretrained classifier head (1000-d), then project.
+                - "penultimate": skip classifier, use avgpool features directly
+                  (1024-d for DenseNet, 2048-d for ResNet), then project.
         """
         super().__init__()
         self.conv_channels = conv_channels
         self.conv_feature_layer = conv_feature_layer.lower()
         self.backbone = backbone.lower()
+        self.fc_mode = fc_mode.lower()
 
-        if self.conv_feature_layer not in CONV_FEATURE_SLICE:
-            raise ValueError(
-                f"conv_feature_layer must be one of {list(CONV_FEATURE_SLICE)}; "
-                f"got {conv_feature_layer!r}."
-            )
         if self.backbone not in _BACKBONE_CHOICES:
             raise ValueError(
                 f"backbone must be one of {_BACKBONE_CHOICES}; got {backbone!r}."
@@ -76,13 +83,41 @@ class ImageEncoder(nn.Module):
         # VGG-19
         # ----------------------------
         if self.backbone == "vgg19":
+            if self.conv_feature_layer not in CONV_FEATURE_SLICE:
+                raise ValueError(
+                    f"conv_feature_layer must be one of {list(CONV_FEATURE_SLICE)}; "
+                    f"got {conv_feature_layer!r}."
+                )
             vgg = models.vgg19(weights=VGG19_Weights.IMAGENET1K_V1)
 
-            # fc branch: features → 512×7×7 (25088) → fc1 4096-d
-            self.features = vgg.features
-            self.fc1 = nn.Sequential(
-                vgg.classifier[0],  # Linear(25088 → 4096)
-                vgg.classifier[1],  # ReLU
+            # Split features into shared prefix + fc-only suffix
+            # VGG classifier: [0]Linear(25088,4096) [1]ReLU [2]Dropout
+            #                 [3]Linear(4096,4096)  [4]ReLU [5]Dropout
+            #                 [6]Linear(4096,1000)
+            children = list(vgg.features.children())
+            slice_idx = CONV_FEATURE_SLICE[self.conv_feature_layer]
+
+            if slice_idx is None:
+                # pool5: shared = all features, no suffix
+                self.features_shared = nn.Sequential(*children)
+                self.features_fc_suffix = nn.Identity()
+            else:
+                # conv5_3 / conv4_3: shared = prefix, suffix = remaining layers
+                self.features_shared = nn.Sequential(*children[:slice_idx])
+                self.features_fc_suffix = nn.Sequential(*children[slice_idx:])
+
+            # fc branch: fc2 activation (4096-d)
+            # Paper Sec 5.1: "image features are extracted by running VGG
+            # pre-trained on ImageNet without fine-tuning" → deterministic
+            # feature extraction.  Dropout is replaced with Identity so that
+            # frozen features stay deterministic regardless of train/eval mode,
+            # while preserving state_dict key indices for checkpoint compat.
+            self.fc_branch = nn.Sequential(
+                vgg.classifier[0],  # [0] Linear(25088 → 4096) fc1
+                vgg.classifier[1],  # [1] ReLU
+                nn.Identity(),      # [2] replaces Dropout — deterministic
+                vgg.classifier[3],  # [3] Linear(4096 → 4096) fc2
+                vgg.classifier[4],  # [4] ReLU
             )
             self.projection = nn.Sequential(
                 nn.Linear(4096, gv_hidden),
@@ -90,22 +125,20 @@ class ImageEncoder(nn.Module):
                 nn.Linear(gv_hidden, output_dim),
             )
 
-            # conv branch
-            children = list(vgg.features.children())
-            slice_idx = CONV_FEATURE_SLICE[self.conv_feature_layer]
-            self.features_conv = (
-                nn.Sequential(*children)
-                if slice_idx is None
-                else nn.Sequential(*children[:slice_idx])
-            )
+            # conv branch: reduce d→K' channels (paper Sec 3.3)
+            # Paper: "non-linear dimensionality reduction to reduce the number
+            # of feature maps as in Sec. (3.2)" → Conv2d + ReLU.
+            # ReLU kept separate to preserve conv_reduce.weight/bias key names
+            # for checkpoint backward compatibility.
             self.conv_reduce = nn.Conv2d(512, conv_channels, kernel_size=3, padding=1)
+            self.conv_reduce_act = nn.ReLU(inplace=True)
 
             # freeze pretrained weights
-            for p in self.features.parameters():
+            for p in self.features_shared.parameters():
                 p.requires_grad = False
-            for p in self.fc1.parameters():
+            for p in self.features_fc_suffix.parameters():
                 p.requires_grad = False
-            for p in self.features_conv.parameters():
+            for p in self.fc_branch.parameters():
                 p.requires_grad = False
 
         # ----------------------------
@@ -113,104 +146,133 @@ class ImageEncoder(nn.Module):
         # ----------------------------
         elif self.backbone == "densenet121":
             dense = models.densenet121(weights=DenseNet121_Weights.IMAGENET1K_V1)
-            self.features = dense.features  # output: [B, 1024, H, W] (before relu+pool)
+
+            # shared = through denseblock3 → 1024×14×14 (conv branch forks here)
+            # suffix = transition3 + denseblock4 + norm5 (fc branch continues)
+            dense_children = list(dense.features.children())
+            self.features_shared = nn.Sequential(*dense_children[:9])   # through denseblock3
+            self.features_fc_suffix = nn.Sequential(*dense_children[9:])  # transition3, denseblock4, norm5
+
+            if self.fc_mode == "penultimate":
+                # Skip classifier: avgpool → 1024-d → projection
+                self.fc_branch = nn.Identity()
+                fc_dim = 1024
+            else:
+                # Default: avgpool → classifier(1024→1000) → projection
+                self.fc_branch = dense.classifier  # Linear(1024 → 1000)
+                fc_dim = 1000
+
             self.projection = nn.Sequential(
-                nn.Linear(1024, gv_hidden),
+                nn.Linear(fc_dim, gv_hidden),
                 nn.ReLU(inplace=True),
                 nn.Linear(gv_hidden, output_dim),
             )
-            for p in self.features.parameters():
-                p.requires_grad = False
 
-            # conv branch: extract after denseblock3 → [B, 1024, 14×14]
-            # DenseNet features children (0-indexed):
-            #   0:conv0 1:norm0 2:relu0 3:pool0 4:denseblock1 5:transition1
-            #   6:denseblock2 7:transition2 8:denseblock3 ...
-            dense_children = list(dense.features.children())
-            self.features_conv = nn.Sequential(*dense_children[:9])  # through denseblock3
+            # conv branch (non-linear reduction, consistent with paper Sec 3.3)
             self.conv_reduce = nn.Conv2d(1024, conv_channels, kernel_size=3, padding=1)
-            for p in self.features_conv.parameters():
+            self.conv_reduce_act = nn.ReLU(inplace=True)
+
+            # freeze pretrained weights
+            for p in self.features_shared.parameters():
                 p.requires_grad = False
-            self.fc1 = None
+            for p in self.features_fc_suffix.parameters():
+                p.requires_grad = False
+            for p in self.fc_branch.parameters():
+                p.requires_grad = False
 
         # ----------------------------
         # ResNet-50
         # ----------------------------
         elif self.backbone == "resnet50":
             resnet = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
-            # Remove final FC; keep avgpool → output: [B, 2048, 1, 1]
-            self.features = nn.Sequential(*list(resnet.children())[:-1])
+
+            # shared = through layer3 → 1024×14×14 (conv branch forks here)
+            # suffix = layer4 + avgpool (fc branch continues)
+            resnet_children = list(resnet.children())
+            self.features_shared = nn.Sequential(*resnet_children[:7])   # through layer3
+            self.features_fc_suffix = nn.Sequential(*resnet_children[7:-1])  # layer4, avgpool
+
+            if self.fc_mode == "penultimate":
+                # Skip fc: avgpool → 2048-d → projection
+                self.fc_branch = nn.Identity()
+                fc_dim = 2048
+            else:
+                # Default: avgpool → fc(2048→1000) → projection
+                self.fc_branch = resnet.fc  # Linear(2048 → 1000)
+                fc_dim = 1000
+
             self.projection = nn.Sequential(
-                nn.Linear(2048, gv_hidden),
+                nn.Linear(fc_dim, gv_hidden),
                 nn.ReLU(inplace=True),
                 nn.Linear(gv_hidden, output_dim),
             )
-            for p in self.features.parameters():
+
+            # conv branch (non-linear reduction, consistent with paper Sec 3.3)
+            self.conv_reduce = nn.Conv2d(1024, conv_channels, kernel_size=3, padding=1)
+            self.conv_reduce_act = nn.ReLU(inplace=True)
+
+            # freeze pretrained weights
+            for p in self.features_shared.parameters():
+                p.requires_grad = False
+            for p in self.features_fc_suffix.parameters():
+                p.requires_grad = False
+            for p in self.fc_branch.parameters():
                 p.requires_grad = False
 
-            # conv branch: extract after layer3 → [B, 1024, 14×14]
-            # ResNet children (0-indexed):
-            #   0:conv1 1:bn1 2:relu 3:maxpool 4:layer1 5:layer2 6:layer3 7:layer4 ...
-            resnet_children = list(resnet.children())
-            self.features_conv = nn.Sequential(*resnet_children[:7])  # through layer3
-            self.conv_reduce = nn.Conv2d(1024, conv_channels, kernel_size=3, padding=1)
-            for p in self.features_conv.parameters():
-                p.requires_grad = False
-            self.fc1 = None
+    def train(self, mode: bool = True):
+        """Override train() to keep frozen modules in eval mode.
+
+        DenseNet-121 and ResNet-50 contain BatchNorm layers inside the frozen
+        shared prefix and fc suffix.  If left in train mode, BatchNorm uses
+        batch statistics (noisy, batch-dependent) instead of pretrained
+        running statistics, silently corrupting frozen feature extraction.
+        VGG-19 has no BatchNorm so this is a no-op for the paper backbone.
+        """
+        super().train(mode)
+        if mode:
+            # Force frozen submodules back to eval so BatchNorm uses
+            # pretrained running_mean / running_var (deterministic features).
+            self.features_shared.eval()
+            self.features_fc_suffix.eval()
+            self.fc_branch.eval()
+        return self
+
+    def _frozen_features(self, x: torch.Tensor):
+        """Run all frozen layers once, return inputs for trainable heads.
+
+        Returns:
+            (fc_in [B, D], shared [B, C, H, W]) for projection and conv_reduce.
+        """
+        with torch.no_grad():
+            shared = self.features_shared(x)
+            fc_x = self.features_fc_suffix(shared)
+            if self.backbone == "densenet121":
+                fc_x = F.relu(fc_x, inplace=False)
+                fc_x = F.adaptive_avg_pool2d(fc_x, (1, 1))
+            fc_x = torch.flatten(fc_x, 1)
+            fc_x = self.fc_branch(fc_x)
+        return fc_x, shared
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute fc branch embeddings from images.
+        """Compute fc branch embeddings. [B,3,224,224] → [B,k]."""
+        fc_x, _ = self._frozen_features(x)
+        return self.projection(fc_x)
 
-        Args:
-            x: Input images [B, 3, 224, 224].
-
-        Returns:
-            Embeddings [B, k].
-        """
-        if self.backbone == "vgg19":
-            with torch.no_grad():
-                x = self.features(x)        # [B, 512, 7, 7]
-                flat = torch.flatten(x, 1)  # [B, 25088]
-                fc1_out = self.fc1(flat)    # [B, 4096]
-            return self.projection(fc1_out)
-
-        elif self.backbone == "densenet121":
-            with torch.no_grad():
-                x = self.features(x)                        # [B, 1024, H, W]
-                x = F.relu(x, inplace=False)
-                x = F.adaptive_avg_pool2d(x, (1, 1))       # [B, 1024, 1, 1]
-                x = torch.flatten(x, 1)                    # [B, 1024]
-            return self.projection(x)
-
-        elif self.backbone == "resnet50":
-            with torch.no_grad():
-                x = self.features(x)        # [B, 2048, 1, 1]
-                x = torch.flatten(x, 1)    # [B, 2048]
-            return self.projection(x)
-
-        else:
-            raise RuntimeError(f"Unsupported backbone in forward: {self.backbone}")
+    def _apply_conv_reduce(self, shared: torch.Tensor) -> torch.Tensor:
+        """Apply conv_reduce + ReLU (paper Sec 3.3 non-linear reduction)."""
+        return self.conv_reduce_act(self.conv_reduce(shared))
 
     def forward_conv_feature(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute conv branch features from images.
+        """Compute conv branch features. [B,3,224,224] → [B,K',H,W]."""
+        with torch.no_grad():
+            shared = self.features_shared(x)
+        return self._apply_conv_reduce(shared)
 
-        Args:
-            x: Input images [B, 3, 224, 224].
+    def forward_both(self, x: torch.Tensor):
+        """Compute both branches, sharing the frozen prefix.
 
         Returns:
-            Conv features [B, K', H, W]:
-              vgg19:       pool5→7×7, conv5_3→14×14, conv4_3→28×28
-              densenet121: denseblock3→14×14
-              resnet50:    layer3→14×14
-
-        Raises:
-            ValueError: If features_conv is not available (should not happen with
-                        the current three supported backbones).
+            (fc_embeddings [B,k], conv_features [B,K',H,W]).
         """
-        if self.features_conv is None:
-            raise ValueError(
-                f"forward_conv_feature is not available for backbone={self.backbone!r}."
-            )
-        with torch.no_grad():
-            x = self.features_conv(x)
-        return self.conv_reduce(x)
+        fc_x, shared = self._frozen_features(x)
+        return self.projection(fc_x), self._apply_conv_reduce(shared)

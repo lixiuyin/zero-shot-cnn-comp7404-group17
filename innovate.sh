@@ -17,6 +17,7 @@
 #   B1  SBERT (all-MiniLM-L6-v2, 384-d)
 #   B2  SBERT-multi (sentence-level pooling, 384-d)
 #   B3  CLIP Text Encoder (ViT-B/32, 512-d)
+#   B4  CLIP-multi (sentence-level pooling, ViT-B/32, 512-d)
 #
 # Section C -- Image backbone ablation (fc+conv, CUB, TF-IDF)
 #   NOTE: conv branch for DenseNet-121 uses denseblock3 output (1024×14×14).
@@ -24,8 +25,32 @@
 #         Both match VGG conv5_3 spatial resolution (14×14).
 #   C1  fc+conv + DenseNet-121
 #   C2  fc+conv + ResNet-50
+#   C3  fc+conv + DenseNet-121 (penultimate: skip classifier, 1024-d)
+#   C4  fc+conv + ResNet-50 (penultimate: skip fc, 2048-d)
+#   C5  fc-only + DenseNet-121 (penultimate: avgpool→1024-d)
+#   C6  fc-only + ResNet-50 (penultimate: avgpool→2048-d)
 # =============================================================================
 set -euo pipefail
+
+# -- Options ------------------------------------------------------------------
+UPLOAD_HF=0
+for arg in "$@"; do
+    case "$arg" in
+        --upload-hf)
+            UPLOAD_HF=1
+            ;;
+        --help|-h)
+            echo "Usage: bash innovate.sh [--upload-hf]"
+            echo "  --upload-hf   Upload checkpoints to HuggingFace when finished"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $arg"
+            echo "Usage: bash innovate.sh [--upload-hf]"
+            exit 1
+            ;;
+    esac
+done
 
 # -- Environment --------------------------------------------------------------
 echo "=== Setting up environment ==="
@@ -48,6 +73,7 @@ mkdir -p "$INNOV_DIR"
 run_eval() {
     local save_base=$1; shift
     if [ "$N_FOLDS" -gt 1 ]; then
+        local evaluated=0
         for i in $(seq 0 $((N_FOLDS - 1))); do
             local ckpt
             ckpt="$(dirname "$save_base")/fold${i}/$(basename "$save_base").pt"
@@ -57,10 +83,25 @@ run_eval() {
                     --checkpoint "$ckpt" \
                     --dataset "$DATASET" \
                     "$@"
+                evaluated=$((evaluated + 1))
+            else
+                echo "  [warn] missing checkpoint for fold${i}: $ckpt"
             fi
         done
+        if [ "$evaluated" -eq 0 ]; then
+            echo "ERROR: no fold checkpoints found for base: $save_base"
+            exit 1
+        fi
+        if [ "$evaluated" -lt "$N_FOLDS" ]; then
+            echo "ERROR: evaluated $evaluated/$N_FOLDS folds for base: $save_base"
+            exit 1
+        fi
     else
         echo "  [evaluate] ${save_base}.pt"
+        if [ ! -f "${save_base}.pt" ]; then
+            echo "ERROR: missing checkpoint: ${save_base}.pt"
+            exit 1
+        fi
         python scripts/evaluate.py \
             --checkpoint "${save_base}.pt" \
             --dataset "$DATASET" \
@@ -169,6 +210,19 @@ python scripts/train.py \
     --save "$B3_SAVE"
 run_eval "$B3_SAVE" --model_type fc+conv --text_encoder clip
 
+# -- B4: CLIP-multi (sentence-level pooling, 512-d) ---------------------------
+echo ""
+echo "--- B4: fc+conv + CLIP-multi text encoder (512-d, sentence-level pooling) ---"
+B4_SAVE="$INNOV_DIR/fc_conv_clip_multi"
+python scripts/train.py \
+    --model_type fc+conv \
+    --dataset $DATASET \
+    --text_encoder clip_multi \
+    --epochs $EPOCHS \
+    --n_folds $N_FOLDS \
+    --save "$B4_SAVE"
+run_eval "$B4_SAVE" --model_type fc+conv --text_encoder clip_multi
+
 # =============================================================================
 # Section C -- Image backbone ablation (fc+conv, CUB, TF-IDF)
 #
@@ -182,9 +236,9 @@ echo "======================================================================="
 echo "=== Section C: Image backbone ablation (fc+conv, CUB, TF-IDF) ==="
 echo "======================================================================="
 
-# -- C1: fc+conv + DenseNet-121 -----------------------------------------------
+# -- C1: fc+conv + DenseNet-121 (default: through classifier 1000-d) ----------
 echo ""
-echo "--- C1: fc+conv + DenseNet-121 (conv branch: denseblock3, 1024×14×14) ---"
+echo "--- C1: fc+conv + DenseNet-121 (default fc: avgpool→classifier→1000-d) ---"
 C1_SAVE="$INNOV_DIR/fc_conv_densenet121"
 python scripts/train.py \
     --model_type fc+conv \
@@ -195,9 +249,9 @@ python scripts/train.py \
     --save "$C1_SAVE"
 run_eval "$C1_SAVE" --model_type fc+conv --image_backbone densenet121
 
-# -- C2: fc+conv + ResNet-50 --------------------------------------------------
+# -- C2: fc+conv + ResNet-50 (default: through fc 1000-d) --------------------
 echo ""
-echo "--- C2: fc+conv + ResNet-50 (conv branch: layer3, 1024×14×14) ---"
+echo "--- C2: fc+conv + ResNet-50 (default fc: avgpool→fc→1000-d) ---"
 C2_SAVE="$INNOV_DIR/fc_conv_resnet50"
 python scripts/train.py \
     --model_type fc+conv \
@@ -207,6 +261,62 @@ python scripts/train.py \
     --n_folds $N_FOLDS \
     --save "$C2_SAVE"
 run_eval "$C2_SAVE" --model_type fc+conv --image_backbone resnet50
+
+# -- C3: fc+conv + DenseNet-121 (penultimate: skip classifier, 1024-d) -------
+echo ""
+echo "--- C3: fc+conv + DenseNet-121 (penultimate: avgpool→1024-d, skip classifier) ---"
+C3_SAVE="$INNOV_DIR/fc_conv_densenet121_penult"
+python scripts/train.py \
+    --model_type fc+conv \
+    --dataset $DATASET \
+    --image_backbone densenet121 \
+    --fc_mode penultimate \
+    --epochs $EPOCHS \
+    --n_folds $N_FOLDS \
+    --save "$C3_SAVE"
+run_eval "$C3_SAVE" --model_type fc+conv --image_backbone densenet121 --fc_mode penultimate
+
+# -- C4: fc+conv + ResNet-50 (penultimate: skip fc, 2048-d) ------------------
+echo ""
+echo "--- C4: fc+conv + ResNet-50 (penultimate: avgpool→2048-d, skip fc) ---"
+C4_SAVE="$INNOV_DIR/fc_conv_resnet50_penult"
+python scripts/train.py \
+    --model_type fc+conv \
+    --dataset $DATASET \
+    --image_backbone resnet50 \
+    --fc_mode penultimate \
+    --epochs $EPOCHS \
+    --n_folds $N_FOLDS \
+    --save "$C4_SAVE"
+run_eval "$C4_SAVE" --model_type fc+conv --image_backbone resnet50 --fc_mode penultimate
+
+# -- C5: fc-only + DenseNet-121 (penultimate) --------------------------------
+echo ""
+echo "--- C5: fc-only + DenseNet-121 (penultimate: avgpool→1024-d) ---"
+C5_SAVE="$INNOV_DIR/fc_densenet121_penult"
+python scripts/train.py \
+    --model_type fc \
+    --dataset $DATASET \
+    --image_backbone densenet121 \
+    --fc_mode penultimate \
+    --epochs $EPOCHS \
+    --n_folds $N_FOLDS \
+    --save "$C5_SAVE"
+run_eval "$C5_SAVE" --model_type fc --image_backbone densenet121 --fc_mode penultimate
+
+# -- C6: fc-only + ResNet-50 (penultimate) -----------------------------------
+echo ""
+echo "--- C6: fc-only + ResNet-50 (penultimate: avgpool→2048-d) ---"
+C6_SAVE="$INNOV_DIR/fc_resnet50_penult"
+python scripts/train.py \
+    --model_type fc \
+    --dataset $DATASET \
+    --image_backbone resnet50 \
+    --fc_mode penultimate \
+    --epochs $EPOCHS \
+    --n_folds $N_FOLDS \
+    --save "$C6_SAVE"
+run_eval "$C6_SAVE" --model_type fc --image_backbone resnet50 --fc_mode penultimate
 
 # =============================================================================
 # Summary table
@@ -225,20 +335,36 @@ python scripts/reproduce/table_innov.py \
 # =============================================================================
 echo ""
 echo "=== Uploading innovation checkpoints to HuggingFace ==="
-huggingface-cli upload LiXiuyin/zero-shot-cnn-comp7404-group17 checkpoints/innov innov --repo-type model
+if [ "$UPLOAD_HF" -eq 1 ]; then
+    hf upload LiXiuyin/zero-shot-cnn-comp7404-group17 checkpoints/ . --repo-type model
+    echo "Upload completed"
+else
+    read -r -p "Do you want to upload checkpoints to HuggingFace? (y/n): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        hf upload LiXiuyin/zero-shot-cnn-comp7404-group17 checkpoints/ . --repo-type model
+        echo "Upload completed"
+    else
+        echo "Upload skipped"
+    fi
+fi
 
 echo ""
 echo "=== innovate.sh complete ==="
 echo ""
 echo "Checkpoint summary (all under $INNOV_DIR/):"
-echo "  A1 (CLIP loss)      : fc_conv_clip.pt"
-echo "  A2 (center align)   : fc_conv_center_align.pt"
-echo "  A3 (embedding MSE)  : fc_conv_embedding_mse.pt"
-echo "  B1 (SBERT)          : fc_conv_sbert.pt"
-echo "  B2 (SBERT-multi)    : fc_conv_sbert_multi.pt"
-echo "  B3 (CLIP text)      : fc_conv_clip_text.pt"
-echo "  C1 (DenseNet-121)   : fc_conv_densenet121.pt"
-echo "  C2 (ResNet-50)      : fc_conv_resnet50.pt"
+echo "  A1 (CLIP loss)               : fc_conv_clip.pt"
+echo "  A2 (center align)            : fc_conv_center_align.pt"
+echo "  A3 (embedding MSE)           : fc_conv_embedding_mse.pt"
+echo "  B1 (SBERT)                   : fc_conv_sbert.pt"
+echo "  B2 (SBERT-multi)             : fc_conv_sbert_multi.pt"
+echo "  B3 (CLIP text)               : fc_conv_clip_text.pt"
+echo "  B4 (CLIP-multi)              : fc_conv_clip_multi.pt"
+echo "  C1 (DenseNet default)        : fc_conv_densenet121.pt"
+echo "  C2 (ResNet default)          : fc_conv_resnet50.pt"
+echo "  C3 (DenseNet penultimate)    : fc_conv_densenet121_penult.pt"
+echo "  C4 (ResNet penultimate)      : fc_conv_resnet50_penult.pt"
+echo "  C5 (DenseNet fc-only penult) : fc_densenet121_penult.pt"
+echo "  C6 (ResNet fc-only penult)   : fc_resnet50_penult.pt"
 echo ""
 echo "For CV (N_FOLDS>1), checkpoints live in $INNOV_DIR/fold{i}/<name>.pt"
 echo "Summary table: results/tables/TableInnov.csv + results/tex/TableInnov.tex"

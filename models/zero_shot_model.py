@@ -24,7 +24,7 @@ class ZeroShotModel(nn.Module):
     Attributes:
         model_type: One of 'fc', 'conv', or 'fc+conv'.
         text_encoder: Encodes text TF-IDF features to embedding space.
-        image_encoder: Encodes images using frozen VGG-19 features.
+        image_encoder: Encodes images using frozen pretrained features.
         conv_weight_predictor: Predicts conv filters from text (conv/fc+conv only).
         conv_channels: Number of conv channels (K' in paper).
     """
@@ -39,6 +39,7 @@ class ZeroShotModel(nn.Module):
         conv_feature_layer: str = "conv5_3",
         image_backbone: str = "vgg19",
         model_type: str = "fc",
+        fc_mode: str = "default",
     ):
         """Initialize the ZeroShotModel.
 
@@ -51,6 +52,7 @@ class ZeroShotModel(nn.Module):
             conv_feature_layer: VGG layer for conv branch ('conv5_3', 'conv4_3', 'pool5').
             image_backbone: Image backbone — 'vgg19', 'densenet121', or 'resnet50'.
             model_type: Model architecture — 'fc', 'conv', or 'fc+conv'.
+            fc_mode: FC branch mode for DenseNet/ResNet — 'default' or 'penultimate'.
         """
         super().__init__()
         self.model_type = model_type.lower()
@@ -75,6 +77,7 @@ class ZeroShotModel(nn.Module):
             conv_channels=conv_channels,
             conv_feature_layer=conv_feature_layer,
             backbone=self.image_backbone,
+            fc_mode=fc_mode,
         )
         self.conv_channels = conv_channels
 
@@ -129,12 +132,17 @@ class ZeroShotModel(nn.Module):
             if return_embeddings:
                 return scores, None, None
             return scores
-        # fc+conv
+        # fc+conv: compute shared prefixes once for both encoders
+        g_emb, conv_feat = self.image_encoder.forward_both(images)
+        f, hidden = self.text_encoder.forward_with_hidden(text_features)
+        fc_scores = g_emb @ f.T
+
+        filters = self.conv_weight_predictor(hidden)
+        conv_scores = F.conv2d(conv_feat, filters, padding=1).flatten(2).mean(2)
+
         if return_embeddings:
-            fc_scores, g, f = self._forward_fc(images, text_features, True)
-            conv_scores = self._forward_conv(images, text_features)
-            return fc_scores + conv_scores, g, f
-        return self._forward_fc(images, text_features) + self._forward_conv(images, text_features)
+            return fc_scores + conv_scores, g_emb, f
+        return fc_scores + conv_scores
 
     def _forward_fc(
         self,
@@ -181,12 +189,12 @@ class ZeroShotModel(nn.Module):
             Conv scores [B, C] from conv(predicted_filters, g'_v(images))
             with global average pooling.
         """
-        # g'_v(x): VGG conv features → [B, K', H, W]
+        # g'_v(x): conv_reduce(shared features) → [B, K', H, W]
         # f'_t(t_h): predict K' filters of size 3x3 → [C, K', 3, 3]
         # Conv: conv2d(g'_v, predicted_filters) → [B, C, H, W]
         # Global avg pool: flatten + mean → [B, C]
         conv_feat = self.image_encoder.forward_conv_feature(images)  # [B, K', H, W]
-        hidden = self.text_encoder.forward_hidden(text_features)    # [C, 300]
+        _, hidden = self.text_encoder.forward_with_hidden(text_features)  # [C, 300]
         filters = self.conv_weight_predictor(hidden)               # [C, K', 3, 3]
         out = F.conv2d(conv_feat, filters, padding=1)               # [B, C, H, W]
         return out.flatten(2).mean(2)                               # [B, C]

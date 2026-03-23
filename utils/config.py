@@ -15,6 +15,7 @@ TEXT_DIM = 9763            # [paper] TF-IDF dimension for CUB/Flowers
 TEXT_DIM_SBERT = 384      # [extension] all-MiniLM-L6-v2 dimension
 TEXT_DIM_SBERT_MULTI = 384  # [extension] SBERT multi-granularity dimension
 TEXT_DIM_CLIP = 512       # [extension] CLIP ViT-B/32 text tower dimension
+TEXT_DIM_CLIP_MULTI = 512 # [extension] CLIP multi-granularity (per-sentence pooling, same dim)
 
 # Text encoder to dimension mapping
 _TEXT_ENCODER_DIMS = {
@@ -22,6 +23,7 @@ _TEXT_ENCODER_DIMS = {
     "sbert": TEXT_DIM_SBERT,
     "sbert_multi": TEXT_DIM_SBERT_MULTI,
     "clip": TEXT_DIM_CLIP,
+    "clip_multi": TEXT_DIM_CLIP_MULTI,
 }
 
 # Joint embedding space

@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from data import ImageClassDataset, prepare_birds_zero_shot
-from scripts.reproduce.common import get_tables_dir, get_tex_dir, read_table_csv, resolve_checkpoint, resolve_cv_checkpoints, write_table_csv
+from scripts.reproduce.common import get_tables_dir, get_tex_dir, read_table_csv, resolve_with_cv, write_table_csv
 from scripts.reproduce.eval_utils import (
     compute_zero_shot_metrics,
     evaluate_cv_folds,
@@ -90,13 +90,11 @@ def main():
         ["mean top-5 acc.", "0.25", "—", "0.153", "—", "0.02", "—"],
     ]
     # column index: Ours (Conv5_3)=2, Ours (Conv4_3)=4, Ours (Pool5)=6
-    # Tuple: (explicit_ckpt, cv_key, conv_feature_layer, col_j)
-    # cv_key for conv5_3 uses "fc_conv_cub_conv5_3" to avoid selecting Flowers or pure-conv folds;
-    # conv4_3/pool5 have no folds so cv_key = conv_feature_layer is fine (no ambiguity).
+    # Tuple: (key, conv_feature_layer, col_j, explicit_ckpt)
     configs = [
-        (resolve_checkpoint(args.checkpoint_conv5, args.checkpoint_dir, "fc_conv_cub_conv5_3"), "fc_conv_cub_conv5_3", "conv5_3", 2),
-        (resolve_checkpoint(args.checkpoint_conv4, args.checkpoint_dir, "conv4_3"), "conv4_3", "conv4_3", 4),
-        (resolve_checkpoint(args.checkpoint_pool5, args.checkpoint_dir, "pool5"), "pool5", "pool5", 6),
+        ("fc_conv_bce_cub_conv5_3", "conv5_3", 2, args.checkpoint_conv5),
+        ("fc_conv_bce_cub_conv4_3", "conv4_3", 4, args.checkpoint_conv4),
+        ("fc_conv_bce_cub_pool5",   "pool5",   6, args.checkpoint_pool5),
     ]
 
     # Track which conv layers will be updated
@@ -106,13 +104,11 @@ def main():
     existing = read_table_csv(tables_dir, 3)
     if existing:
         existing_headers, existing_rows = existing
-        # Determine which layers will be updated based on command line args
-        if args.checkpoint_conv5 and Path(args.checkpoint_conv5).exists():
-            layers_to_update.add("conv5_3")
-        if args.checkpoint_conv4 and Path(args.checkpoint_conv4).exists():
-            layers_to_update.add("conv4_3")
-        if args.checkpoint_pool5 and Path(args.checkpoint_pool5).exists():
-            layers_to_update.add("pool5")
+        # Determine which layers will be updated based on resolved checkpoints
+        for key, conv_layer, _, explicit in configs:
+            root, folds = resolve_with_cv(key, args.n_folds, args.checkpoint_dir, explicit)
+            if root or len(folds) >= 2:
+                layers_to_update.add(conv_layer)
 
         # Merge: keep Paper values, preserve "Ours" values ONLY for layers NOT being updated
         for i, row in enumerate(existing_rows):
@@ -148,8 +144,8 @@ def main():
             )
             from tqdm import tqdm
 
-            for explicit_ckpt, cv_key, conv_layer, col_j in tqdm(configs, desc="Conv layers", unit="model"):
-                fold_ckpts = resolve_cv_checkpoints(cv_key, args.n_folds, args.checkpoint_dir)
+            for key, conv_layer, col_j, explicit in tqdm(configs, desc="Conv layers", unit="model"):
+                root, fold_ckpts = resolve_with_cv(key, args.n_folds, args.checkpoint_dir, explicit)
                 if len(fold_ckpts) >= 2:
                     print(f"  {conv_layer}: averaging {len(fold_ckpts)} CV folds (per-fold split)")
                     m = evaluate_cv_folds(
@@ -167,7 +163,7 @@ def main():
                         **base_kw,
                     )
                 else:
-                    ckpt = explicit_ckpt  # already resolved above
+                    ckpt = root
                     if not ckpt:
                         continue
                     model = load_model(
